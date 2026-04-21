@@ -1,0 +1,13 @@
+# Core
+websockets
+python-dotenv
+cryptography
+
+# TFT model
+torch
+pytorch-forecasting
+lightning
+polars
+pyarrow
+httpx
+numpy

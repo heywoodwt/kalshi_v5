@@ -1,0 +1,9 @@
+# Ignore /rsa_keys & .env files
+rsa_keys/
+.env
+
+# TFT model checkpoints & training artifacts
+model/tft/checkpoints/
+lightning_logs/
+csv_logs/
+__pycache__/
