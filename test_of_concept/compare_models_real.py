@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -38,13 +39,26 @@ from model.tft.feature_engineer import engineer_features
 from model.hp_dfm_rte.config import PipelineConfig
 from model.hp_dfm_rte.model_engine import make_engine
 from model.hp_dfm_rte.signal_gen import SignalGenerator
-from model.hp_dfm_rte.fees import round_trip_fee
+from model.hp_dfm_rte.fees import (
+    backtest_fee_mode,
+    expected_value_cents,
+    median_round_trip_fee_burden_cents,
+    round_trip_fee,
+)
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _backtest_maker_override() -> bool:
+    """Taker-by-default fee mode for backtests with optional env override."""
+    raw = os.environ.get("BACKTEST_ASSUME_MAKER")
+    return backtest_fee_mode(
+        assume_maker=(raw.lower() in ("true", "1", "yes")) if raw is not None else None
+    )
 
 
 # ── Data Pipeline ────────────────────────────────────────────────────────────
@@ -195,6 +209,24 @@ def _walk_forward_hp_dfm_rte(
     Also generates signals and simulates PnL.
     """
     cfg = PipelineConfig()
+    backtest_maker = _backtest_maker_override()
+
+    # Pre-run expectancy guardrail:
+    # reject configurations that do not clear median fee burden.
+    expectancy = expected_value_cents(
+        cfg.expectancy_win_rate,
+        cfg.expectancy_avg_win_cents,
+        cfg.expectancy_avg_loss_cents,
+    )
+    median_fee_burden = median_round_trip_fee_burden_cents(maker=backtest_maker)
+    if expectancy <= median_fee_burden:
+        return {
+            "error": (
+                "Rejected config: expectancy does not exceed median fee burden "
+                f"(expectancy={expectancy:.3f}c, median_fee_burden={median_fee_burden:.3f}c)."
+            )
+        }
+
     engine = make_engine(cfg)
     signal_gen = SignalGenerator(cfg)
 
@@ -219,6 +251,9 @@ def _walk_forward_hp_dfm_rte(
     fit_times = []
     all_signals = []
     simulated_pnl = []  # Per-signal simulated PnL
+    gross_move_pnl = []
+    fees_paid = []
+    slippage_paid = []
 
     for step in range(n_steps):
         # Build window panel
@@ -285,14 +320,18 @@ def _walk_forward_hp_dfm_rte(
                     actual_move = actuals[t] - current_prices[t]
                     if sig.direction.value == "BUY_YES":
                         # Bought yes: profit if price went up
-                        pnl = actual_move
+                        move_pnl = actual_move
                     else:
                         # Bought no: profit if price went down
-                        pnl = -actual_move
-                    # Subtract estimated round-trip fee
+                        move_pnl = -actual_move
+                    # Subtract estimated round-trip fee (taker by default in backtests)
                     price_int = max(1, min(99, int(round(current_prices[t]))))
-                    fee = round_trip_fee(price_int, price_int, maker=True)
-                    simulated_pnl.append(pnl - fee)
+                    fee = round_trip_fee(price_int, price_int, maker=backtest_maker)
+                    slippage = 2.0 * float(cfg.orderbook_slippage_cents)
+                    simulated_pnl.append(move_pnl - fee - slippage)
+                    gross_move_pnl.append(float(move_pnl))
+                    fees_paid.append(float(fee))
+                    slippage_paid.append(float(slippage))
 
     if not abs_errors:
         return {"error": "No valid evaluation steps"}
@@ -315,6 +354,12 @@ def _walk_forward_hp_dfm_rte(
         "mean_pnl": float(np.mean(simulated_pnl)) if simulated_pnl else 0.0,
         "win_rate": (sum(1 for p in simulated_pnl if p > 0) / len(simulated_pnl)
                      if simulated_pnl else 0.0),
+        "pnl_decomposition": {
+            "price_move_pnl_cents": float(np.sum(gross_move_pnl)) if gross_move_pnl else 0.0,
+            "fees_paid_cents": float(np.sum(fees_paid)) if fees_paid else 0.0,
+            "slippage_paid_cents": float(np.sum(slippage_paid)) if slippage_paid else 0.0,
+            "net_pnl_cents": float(np.sum(simulated_pnl)) if simulated_pnl else 0.0,
+        },
     }
 
 
@@ -367,6 +412,7 @@ def _walk_forward_tft(
     ci_hits = 0
     uncertainties = []
     simulated_pnl = []
+    backtest_maker = _backtest_maker_override()
 
     for step in eval_steps:
         # Build window DataFrame for all tickers
@@ -439,7 +485,7 @@ def _walk_forward_tft(
                 else:
                     pnl = -(actual - current)  # Bought no
                 price_int = max(1, min(99, int(round(current))))
-                fee = round_trip_fee(price_int, price_int, maker=True)
+                fee = round_trip_fee(price_int, price_int, maker=backtest_maker)
                 simulated_pnl.append(pnl - fee)
 
     if not abs_errors:

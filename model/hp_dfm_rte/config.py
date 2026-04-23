@@ -98,6 +98,11 @@ class PipelineConfig:
     # Fees
     assume_maker: bool = True
 
+    # Expectancy guardrail (used by backtests / sims)
+    expectancy_win_rate: float = 0.55
+    expectancy_avg_win_cents: float = 3.0
+    expectancy_avg_loss_cents: float = 6.0
+
     # Trading / Order execution
     trading_enabled: bool = False
     paper_trading: bool = True
@@ -113,6 +118,24 @@ class PipelineConfig:
     # Logging
     log_level: str = "INFO"
     log_file: str = ""
+
+    @classmethod
+    def with_profile(cls, profile_name: str) -> PipelineConfig:
+        """Create a config with named profile overrides applied."""
+        cfg = cls()
+        profiles: dict[str, dict[str, float | bool]] = {
+            "econ_v1": {
+                "profit_target_cents": 3.0,
+                "stop_loss_cents": 6.0,
+                "assume_maker": False,
+            },
+        }
+        overrides = profiles.get(profile_name)
+        if overrides is None:
+            raise ValueError(f"Unknown profile: {profile_name}")
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return cfg
 
     @classmethod
     def from_env(cls) -> PipelineConfig:
@@ -194,6 +217,9 @@ class PipelineConfig:
             orderbook_min_size=int(os.environ.get("ORDERBOOK_MIN_SIZE", cls.orderbook_min_size)),
             orderbook_slippage_cents=float(os.environ.get("ORDERBOOK_SLIPPAGE_CENTS", cls.orderbook_slippage_cents)),
             assume_maker=os.environ.get("ASSUME_MAKER", "true").lower() in ("true", "1", "yes"),
+            expectancy_win_rate=float(os.environ.get("EXPECTANCY_WIN_RATE", cls.expectancy_win_rate)),
+            expectancy_avg_win_cents=float(os.environ.get("EXPECTANCY_AVG_WIN_CENTS", cls.expectancy_avg_win_cents)),
+            expectancy_avg_loss_cents=float(os.environ.get("EXPECTANCY_AVG_LOSS_CENTS", cls.expectancy_avg_loss_cents)),
             trading_enabled=os.environ.get("TRADING_ENABLED", "false").lower() in ("true", "1", "yes"),
             paper_trading=os.environ.get("PAPER_TRADING", "true").lower() in ("true", "1", "yes"),
             order_count=int(os.environ.get("ORDER_COUNT", cls.order_count)),
