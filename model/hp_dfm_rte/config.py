@@ -7,6 +7,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+PROFILE_OVERRIDES: dict[str, dict[str, int | float | bool]] = {
+    "throughput_v1": {
+        "signal_threshold": 0.10,
+        "price_filter_min": 10.0,
+        "price_filter_max": 90.0,
+        "expiry_blackout_minutes": 2,
+        "cooldown_s": 30,
+        "z_score_price_scaling": False,
+    },
+}
+
+
 @dataclass
 class PipelineConfig:
     # Kalshi auth
@@ -153,7 +165,7 @@ class PipelineConfig:
                 if key and value:
                     os.environ.setdefault(key, value)
 
-        return cls(
+        config = cls(
             kalshi_api_key_id=os.environ.get(
                 "KALSHI_API_KEY_ID", os.environ.get("PROD_API_KEY", "")
             ),
@@ -231,3 +243,12 @@ class PipelineConfig:
             log_level=os.environ.get("LOG_LEVEL", cls.log_level),
             log_file=os.environ.get("LOG_FILE", ""),
         )
+
+        profile_name = os.environ.get("PIPELINE_PROFILE", "").strip()
+        if profile_name:
+            overrides = PROFILE_OVERRIDES.get(profile_name)
+            if overrides:
+                for key, value in overrides.items():
+                    setattr(config, key, value)
+
+        return config
