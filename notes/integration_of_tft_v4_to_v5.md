@@ -1,6 +1,6 @@
-Integration complete. Here's a summary of what was done:
+## Integration complete. Here's a summary of what was done:
 
-Files Created
+## Files Created
 
 ┌───────────────────────────────┬──────────────────────────────────────────────────────────────────────────────┐                                                              
 │             File              │                                   Purpose                                    │                                                            
@@ -20,7 +20,7 @@ Files Created
 │ model/tft/train_tft.py        │ CLI training entry point                                                     │
 └───────────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
 
-Files Modified
+## Files Modified
 
 ┌──────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────┐
 │           File           │                                         Changes                                          │
@@ -32,7 +32,7 @@ Files Modified
 │ requirements.txt         │ Added torch, pytorch-forecasting, lightning, polars, pyarrow, httpx                      │
 └──────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────┘
 
-Key Design Decisions
+## Key Design Decisions
 
 - Zero external dependencies on kalshi_v4 — all btc_signal_pipeline imports removed; fees inlined, data fetcher standalone
 - Backward compatible — ModelInterface API unchanged; predict(ticker, features) -> float still works. Falls back to passthrough when no checkpoint exists
@@ -41,12 +41,18 @@ Key Design Decisions
 
 Usage
 
-# Train with synthetic data
+## Train with synthetic data
 python -m model.tft.train_tft --synthetic --max-epochs 50
 
-# Train from saved trade data
+## Train from saved trade data
 python -m model.tft.train_tft --data-file trades.parquet --enrich
 
-# Run bot (auto-loads checkpoint if present)
+## Run bot (auto-loads checkpoint if present)
 python main.py
+
+## Next Steps
+
+- Run on Real Data: Since the synthetic test passed, you're ready to pipe in your actual Kalshi event data.
+- Adjust num_workers: Set this to around 8 or 10 in your model.tft.tft_dataset script to speed up training on larger datasets.
+- Check LR: If the model struggles with real data, you might need to manually set the learning_rate in your train_tft script since the auto-finder failed here.
 

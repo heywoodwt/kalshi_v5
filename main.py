@@ -33,9 +33,10 @@ from config import (
     BUY_PROB_THRESHOLD, SELL_PROB_THRESHOLD, EDGE_VOL_THRESHOLD,
 )
 from market_selector.market_filter import is_btc_market, register_market
-from volatility import VolatilityTracker
+from order_management.volatility import VolatilityTracker
 from model.model_interface import ModelInterface
 from market_selector.quoting_engine import generate_quotes, format_quotes
+from model.hp_dfm_rte.orderbook import OrderbookSnapshot, extract_orderbook_snapshot
 from authentication_to_kalshi.websocket_client import KalshiWebSocket
 
 # Configure logging format
@@ -56,8 +57,8 @@ vol_trackers: Dict[str, VolatilityTracker] = {}
 # Recent trade counts for each market (ticker -> count)
 trade_counts: Dict[str, int] = {}
 
-# Current orderbooks for each market (ticker -> {"yes": [...], "no": [...]})
-orderbooks: Dict[str, Dict] = {}
+# Current orderbooks for each market (ticker -> compact normalized snapshot)
+orderbooks: Dict[str, OrderbookSnapshot] = {}
 
 # Current inventory for each market (ticker -> position)
 # Positive = long, negative = short, zero = flat
@@ -84,7 +85,7 @@ def _get_tracker(ticker: str) -> VolatilityTracker:
         # First time seeing this market - initialize all state
         vol_trackers[ticker] = VolatilityTracker()
         trade_counts[ticker] = 0
-        orderbooks[ticker] = {"yes": [], "no": []}
+        orderbooks[ticker] = OrderbookSnapshot(ticker=ticker)
         inventory[ticker] = 0
 
     return vol_trackers[ticker]
@@ -122,8 +123,16 @@ def on_ticker(msg: Dict) -> None:
         log.info("Discovered BTC market: %s", ticker)
 
     # Extract price (prefer yes_ask, fallback to last_price)
-    price = data.get("yes_ask") or data.get("last_price")
-    if price is None:
+    raw_price = data.get("yes_ask") or data.get("last_price")
+    if raw_price is None:
+        return
+
+    if not isinstance(raw_price, (int, float, str)):
+        return
+
+    try:
+        price = float(raw_price)
+    except (TypeError, ValueError):
         return
 
     # Kalshi sends prices in cents (0-100) or decimal (0.0-1.0)
@@ -192,11 +201,10 @@ def on_orderbook_delta(msg: Dict) -> None:
     # Ensure market state exists
     _get_tracker(ticker)
 
-    # Update stored orderbook (for future use)
-    if "yes" in data:
-        orderbooks[ticker]["yes"] = data["yes"]
-    if "no" in data:
-        orderbooks[ticker]["no"] = data["no"]
+    # Normalize the payload once so downstream code sees a compact snapshot.
+    snapshot = extract_orderbook_snapshot(data)
+    if snapshot is not None:
+        orderbooks[ticker] = snapshot
 
 
 # ============================================================================

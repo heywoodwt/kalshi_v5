@@ -3,7 +3,7 @@ Controlled test to show what orders would be generated.
 Forces market conditions to pass all filters.
 """
 import logging
-from volatility import VolatilityTracker
+from order_management.volatility import VolatilityTracker
 from market_selector.quoting_engine import generate_quotes, format_quotes
 
 logging.basicConfig(

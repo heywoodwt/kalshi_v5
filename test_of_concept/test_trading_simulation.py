@@ -8,7 +8,7 @@ from config import (
     BUY_PROB_THRESHOLD, SELL_PROB_THRESHOLD, EDGE_VOL_THRESHOLD,
 )
 from market_selector.market_filter import is_btc_market
-from volatility import VolatilityTracker
+from order_management.volatility import VolatilityTracker
 from market_selector.quoting_engine import generate_quotes, format_quotes
 
 logging.basicConfig(
