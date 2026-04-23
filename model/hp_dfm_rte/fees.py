@@ -43,6 +43,29 @@ def round_trip_fee(
     return fee_fn(entry_price_cents, contracts) + fee_fn(exit_price_cents, contracts)
 
 
+def backtest_fee_mode(assume_maker: bool | None = None) -> bool:
+    """Resolve maker/taker mode for backtests.
+
+    Defaults to taker fees unless explicitly overridden.
+    """
+    return bool(assume_maker) if assume_maker is not None else False
+
+
+def expected_value_cents(win_rate: float, avg_win_cents: float, avg_loss_cents: float) -> float:
+    """Per-trade expectancy before fees/slippage."""
+    return (win_rate * avg_win_cents) - ((1.0 - win_rate) * avg_loss_cents)
+
+
+def median_round_trip_fee_burden_cents(contracts: int = 1, maker: bool = False) -> float:
+    """Median round-trip fee burden across representative contract prices."""
+    burdens = [round_trip_fee(px, px, contracts=contracts, maker=maker) for px in range(1, 100)]
+    burdens.sort()
+    mid = len(burdens) // 2
+    if len(burdens) % 2 == 1:
+        return float(burdens[mid])
+    return 0.5 * (burdens[mid - 1] + burdens[mid])
+
+
 def net_pnl(
     entry_price: int,
     exit_price: int,
