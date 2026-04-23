@@ -46,6 +46,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MIN_VARIANT_TRADE_SAMPLES = 30
+
 
 # ── Data Pipeline ────────────────────────────────────────────────────────────
 
@@ -519,10 +521,16 @@ def _print_model_results(name: str, r: dict):
 
     if r["n_signals"] > 0:
         print(f"\n  Simulated Trading ({r['n_signals']} trades):")
-        print(f"    Total PnL:          {r['total_pnl']:+.1f}c")
-        print(f"    Mean PnL/trade:     {r['mean_pnl']:+.2f}c")
-        print(f"    Win rate:           {r['win_rate']:.1%}")
-        if r["simulated_pnl"]:
+        if r["n_signals"] < MIN_VARIANT_TRADE_SAMPLES:
+            print(
+                "    Sample gate:        SKIP comparison metrics "
+                f"(<{MIN_VARIANT_TRADE_SAMPLES} trades)"
+            )
+        else:
+            print(f"    Total PnL:          {r['total_pnl']:+.1f}c")
+            print(f"    Mean PnL/trade:     {r['mean_pnl']:+.2f}c")
+            print(f"    Win rate:           {r['win_rate']:.1%}")
+        if r["simulated_pnl"] and r["n_signals"] >= MIN_VARIANT_TRADE_SAMPLES:
             pnl = r["simulated_pnl"]
             print(f"    Best trade:         {max(pnl):+.2f}c")
             print(f"    Worst trade:        {min(pnl):+.2f}c")
@@ -643,18 +651,21 @@ def main():
         if hp_result["n_signals"] > 0 or tft_result["n_signals"] > 0:
             print(f"\n  {'Trading Metric':<25} {'HP-DFM-RTE':>14} {'TFT':>14} {'Winner':>14}")
             print(f"  {'-'*25} {'-'*14} {'-'*14} {'-'*14}")
-
-            hp_pnl = hp_result["total_pnl"]
-            tft_pnl = tft_result["total_pnl"]
-            pnl_winner = "HP-DFM-RTE" if hp_pnl > tft_pnl else "TFT"
-            print(f"  {'Total PnL (cents)':<25} {hp_pnl:>+13.1f} {tft_pnl:>+13.1f}  {pnl_winner:>13}")
-
-            hp_wr = hp_result["win_rate"]
-            tft_wr = tft_result["win_rate"]
-            wr_winner = "HP-DFM-RTE" if hp_wr > tft_wr else "TFT"
-            print(f"  {'Win Rate':<25} {hp_wr:>13.1%} {tft_wr:>13.1%}  {wr_winner:>13}")
-
+            print(f"  {'Min sample gate':<25} {MIN_VARIANT_TRADE_SAMPLES:>14} {MIN_VARIANT_TRADE_SAMPLES:>14}")
             print(f"  {'Trades Generated':<25} {hp_result['n_signals']:>14} {tft_result['n_signals']:>14}")
+
+            if hp_result["n_signals"] >= MIN_VARIANT_TRADE_SAMPLES and tft_result["n_signals"] >= MIN_VARIANT_TRADE_SAMPLES:
+                hp_pnl = hp_result["total_pnl"]
+                tft_pnl = tft_result["total_pnl"]
+                pnl_winner = "HP-DFM-RTE" if hp_pnl > tft_pnl else "TFT"
+                print(f"  {'Total PnL (cents)':<25} {hp_pnl:>+13.1f} {tft_pnl:>+13.1f}  {pnl_winner:>13}")
+
+                hp_wr = hp_result["win_rate"]
+                tft_wr = tft_result["win_rate"]
+                wr_winner = "HP-DFM-RTE" if hp_wr > tft_wr else "TFT"
+                print(f"  {'Win Rate':<25} {hp_wr:>13.1%} {tft_wr:>13.1%}  {wr_winner:>13}")
+            else:
+                print("  Trading comparison skipped: insufficient trades for one or both variants.")
 
     elif hp_ok:
         print("\n  Only HP-DFM-RTE produced results (TFT failed).")
@@ -685,11 +696,15 @@ def main():
         print(f"\n  Accuracy metrics won:  HP-DFM-RTE={wins['HP-DFM-RTE']}  TFT={wins['TFT']}")
         print(f"  Overall winner:       {overall}")
 
-        if hp_result["n_signals"] > 0 and tft_result["n_signals"] > 0:
+        if hp_result["n_signals"] >= MIN_VARIANT_TRADE_SAMPLES and tft_result["n_signals"] >= MIN_VARIANT_TRADE_SAMPLES:
             if hp_result["total_pnl"] > tft_result["total_pnl"]:
                 print(f"  More profitable:      HP-DFM-RTE ({hp_result['total_pnl']:+.1f}c vs {tft_result['total_pnl']:+.1f}c)")
             else:
                 print(f"  More profitable:      TFT ({tft_result['total_pnl']:+.1f}c vs {hp_result['total_pnl']:+.1f}c)")
+        else:
+            print(
+                f"  Profitability:        Not compared (<{MIN_VARIANT_TRADE_SAMPLES} trades for one or both variants)"
+            )
 
     print(f"\n  Data source: Real BTC spot from exchange APIs")
     print(f"  Spot candles: {spot_df.height}")
