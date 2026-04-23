@@ -1,0 +1,22 @@
+# Reproducible real-BTC baseline for compare_models_real.py.
+# Values mirror current production defaults for fee mode and model behavior,
+# plus explicit backtest controls for deterministic A/B comparisons.
+
+# Backtest controls
+n_contracts: 5
+hp_window: 60
+hp_max_steps: 200
+tft_window: 80
+tft_max_steps: 50
+
+# Production-aligned defaults
+assume_maker: true
+signal_threshold: 0.005
+min_edge_cents: 3.0
+price_filter_min: 20.0
+price_filter_max: 80.0
+min_expected_move_multiple: 2.0
+exit_z_threshold: 0.5
+profit_target_cents: 5.0
+stop_loss_cents: 10.0
+holding_period_minutes: 20.0

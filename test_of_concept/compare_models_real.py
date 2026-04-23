@@ -17,8 +17,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -45,6 +48,166 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+BASELINE_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "model"
+    / "hp_dfm_rte"
+    / "configs"
+    / "baseline_real_btc.yaml"
+)
+
+
+def _parse_scalar_yaml(value: str):
+    """Parse a simple YAML scalar into bool/int/float/str."""
+    raw = value.strip()
+    lower = raw.lower()
+    if lower in {"true", "false"}:
+        return lower == "true"
+    try:
+        if "." in raw:
+            return float(raw)
+        return int(raw)
+    except ValueError:
+        return raw.strip("'\"")
+
+
+def _load_flat_yaml(path: Path) -> dict[str, object]:
+    """Load a flat `key: value` YAML file without external dependencies."""
+    parsed: dict[str, object] = {}
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parsed[key.strip()] = _parse_scalar_yaml(value)
+    return parsed
+
+
+def _git_commit_hash() -> str:
+    """Return current git commit hash, or 'unknown' outside git contexts."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _compute_trade_metrics(trades: list[dict[str, object]]) -> dict[str, object]:
+    """Compute mandatory strategy metrics from net/gross trade PnL."""
+    if not trades:
+        return {
+            "total_pnl_gross": 0.0,
+            "total_pnl_net": 0.0,
+            "win_rate": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "expectancy_per_trade": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "trade_count": 0,
+            "exit_reason_histogram": {},
+        }
+
+    gross = np.array([float(t["pnl_gross"]) for t in trades], dtype=np.float64)
+    net = np.array([float(t["pnl_net"]) for t in trades], dtype=np.float64)
+    wins = net[net > 0]
+    losses = net[net < 0]
+
+    equity = np.cumsum(net)
+    running_peak = np.maximum.accumulate(equity)
+    drawdowns = running_peak - equity
+    max_drawdown = float(np.max(drawdowns)) if drawdowns.size else 0.0
+
+    exit_hist: dict[str, int] = {}
+    for t in trades:
+        reason = str(t["exit_reason"])
+        exit_hist[reason] = exit_hist.get(reason, 0) + 1
+
+    sharpe = 0.0
+    if len(net) > 1:
+        std = float(np.std(net))
+        if std > 1e-12:
+            sharpe = float(np.mean(net) / std * np.sqrt(len(net)))
+
+    return {
+        "total_pnl_gross": float(np.sum(gross)),
+        "total_pnl_net": float(np.sum(net)),
+        "win_rate": float(len(wins) / len(net)),
+        "avg_win": float(np.mean(wins)) if len(wins) else 0.0,
+        "avg_loss": float(np.mean(losses)) if len(losses) else 0.0,
+        "expectancy_per_trade": float(np.mean(net)),
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+        "trade_count": int(len(net)),
+        "exit_reason_histogram": exit_hist,
+    }
+
+
+def _persist_backtest_artifacts(
+    config_path: Path,
+    backtest_cfg: dict[str, object],
+    contracts_df: pl.DataFrame,
+    trades: list[dict[str, object]],
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    """Persist deterministic baseline artifacts for A/B backtest comparison."""
+    config_blob = config_path.read_bytes()
+    config_hash = hashlib.sha256(config_blob).hexdigest()
+    commit_hash = _git_commit_hash()
+    tickers = sorted(contracts_df["ticker"].unique().to_list())
+    start_ts = contracts_df["timestamp"].min()
+    end_ts = contracts_df["timestamp"].max()
+    fee_mode = "maker" if bool(backtest_cfg.get("assume_maker", True)) else "taker"
+
+    deterministic_seed = "|".join(
+        [
+            commit_hash,
+            config_hash,
+            str(start_ts),
+            str(end_ts),
+            ",".join(tickers),
+            fee_mode,
+        ]
+    )
+    run_id = hashlib.sha256(deterministic_seed.encode("utf-8")).hexdigest()[:16]
+
+    artifact_dir = Path("artifacts") / "backtests" / run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "run_id": run_id,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "commit_hash": commit_hash,
+        "config_path": str(config_path),
+        "config_hash": config_hash,
+        "date_range": {"start": str(start_ts), "end": str(end_ts)},
+        "ticker_universe": tickers,
+        "fee_mode": fee_mode,
+    }
+    (artifact_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    metrics = _compute_trade_metrics(trades)
+    (artifact_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    ledger_df = pl.DataFrame(trades) if trades else pl.DataFrame({
+        "timestamp": [],
+        "side": [],
+        "entry_price": [],
+        "exit_price": [],
+        "fees": [],
+        "holding_time_minutes": [],
+        "entry_z": [],
+        "exit_z": [],
+        "expected_move_at_entry": [],
+        "ticker": [],
+        "exit_reason": [],
+        "pnl_gross": [],
+        "pnl_net": [],
+    })
+    ledger_df.write_csv(artifact_dir / "trade_ledger.csv")
+    return artifact_dir, manifest, metrics
 
 
 # ── Data Pipeline ────────────────────────────────────────────────────────────
@@ -186,6 +349,7 @@ def _build_hp_panel(df: pl.DataFrame) -> pl.DataFrame | None:
 def _walk_forward_hp_dfm_rte(
     df: pl.DataFrame,
     tickers: list[str],
+    cfg: PipelineConfig | None = None,
     window: int = 60,
     max_steps: int = 200,
 ) -> dict:
@@ -194,7 +358,7 @@ def _walk_forward_hp_dfm_rte(
     At each step: fit on [t-window : t], predict t+1, compare to actual.
     Also generates signals and simulates PnL.
     """
-    cfg = PipelineConfig()
+    cfg = cfg or PipelineConfig()
     engine = make_engine(cfg)
     signal_gen = SignalGenerator(cfg)
 
@@ -218,13 +382,16 @@ def _walk_forward_hp_dfm_rte(
     dir_total = 0
     fit_times = []
     all_signals = []
-    simulated_pnl = []  # Per-signal simulated PnL
+    simulated_pnl = []  # Per-signal net PnL
+    trades: list[dict[str, object]] = []
 
     for step in range(n_steps):
         # Build window panel
         rows = []
         actuals = {}
         current_prices = {}
+        entry_timestamps = {}
+        exit_timestamps = {}
         for t, td in ticker_data.items():
             w = td.slice(step, window)
             nxt = td.slice(step + window, 1)
@@ -232,6 +399,8 @@ def _walk_forward_hp_dfm_rte(
                 continue
             actuals[t] = float(nxt["yes_price"][0])
             current_prices[t] = float(w["yes_price"][-1])
+            entry_timestamps[t] = w["timestamp"][-1]
+            exit_timestamps[t] = nxt["timestamp"][0]
             for i in range(w.height):
                 rows.append({
                     "timestamp": w["timestamp"][i],
@@ -285,14 +454,43 @@ def _walk_forward_hp_dfm_rte(
                     actual_move = actuals[t] - current_prices[t]
                     if sig.direction.value == "BUY_YES":
                         # Bought yes: profit if price went up
-                        pnl = actual_move
+                        pnl_gross = actual_move
                     else:
                         # Bought no: profit if price went down
-                        pnl = -actual_move
+                        pnl_gross = -actual_move
                     # Subtract estimated round-trip fee
-                    price_int = max(1, min(99, int(round(current_prices[t]))))
-                    fee = round_trip_fee(price_int, price_int, maker=True)
-                    simulated_pnl.append(pnl - fee)
+                    entry_px = current_prices[t]
+                    exit_px = actuals[t]
+                    entry_int = max(1, min(99, int(round(entry_px))))
+                    exit_int = max(1, min(99, int(round(exit_px))))
+                    fee = round_trip_fee(entry_int, exit_int, maker=cfg.assume_maker)
+                    pnl_net = pnl_gross - fee
+                    simulated_pnl.append(pnl_net)
+
+                    # Estimate exit z-score from realized next price versus trend.
+                    denom = sig.residual_std if abs(sig.residual_std) > 1e-12 else 1e-12
+                    exit_cycle_est = exit_px - sig.trend
+                    exit_z = -exit_cycle_est / denom
+                    expected_move = sig.residual_std * abs(sig.z_score) * 100.0
+
+                    entry_ts = entry_timestamps[t]
+                    exit_ts = exit_timestamps[t]
+                    hold_min = ((exit_ts - entry_ts).total_seconds() / 60.0)
+                    trades.append({
+                        "timestamp": entry_ts.isoformat(),
+                        "ticker": t,
+                        "side": sig.direction.value,
+                        "entry_price": float(entry_px),
+                        "exit_price": float(exit_px),
+                        "fees": float(fee),
+                        "holding_time_minutes": float(hold_min),
+                        "entry_z": float(sig.z_score),
+                        "exit_z": float(exit_z),
+                        "expected_move_at_entry": float(expected_move),
+                        "exit_reason": "NEXT_BAR_MARK_TO_MARKET",
+                        "pnl_gross": float(pnl_gross),
+                        "pnl_net": float(pnl_net),
+                    })
 
     if not abs_errors:
         return {"error": "No valid evaluation steps"}
@@ -315,6 +513,7 @@ def _walk_forward_hp_dfm_rte(
         "mean_pnl": float(np.mean(simulated_pnl)) if simulated_pnl else 0.0,
         "win_rate": (sum(1 for p in simulated_pnl if p > 0) / len(simulated_pnl)
                      if simulated_pnl else 0.0),
+        "trade_ledger": trades,
     }
 
 
@@ -537,6 +736,15 @@ def main():
     print("  MODEL COMPARISON: TFT vs HP-DFM-RTE (REAL DATA)")
     print("=" * 70)
 
+    # ── Load reproducible baseline config ────────────────────────────────
+    if not BASELINE_CONFIG_PATH.exists():
+        print(f"\n  ERROR: Missing baseline config: {BASELINE_CONFIG_PATH}")
+        return
+    backtest_cfg = _load_flat_yaml(BASELINE_CONFIG_PATH)
+    model_cfg = PipelineConfig()
+    if "assume_maker" in backtest_cfg:
+        model_cfg.assume_maker = bool(backtest_cfg["assume_maker"])
+
     # ── Fetch real data ──────────────────────────────────────────────────
     _print_section("DATA PIPELINE", "=")
 
@@ -552,7 +760,7 @@ def main():
         return
 
     # Derive contract prices from real spot
-    n_contracts = 5
+    n_contracts = int(backtest_cfg.get("n_contracts", 5))
     print(f"\n  Deriving {n_contracts} contract prices from real spot dynamics...")
     contracts_df = _spot_to_contract_prices(spot_df, n_contracts=n_contracts)
     tickers = contracts_df["ticker"].unique().to_list()
@@ -578,14 +786,50 @@ def main():
     _print_section("HP-DFM-RTE MODEL")
     print("\n  Running walk-forward backtest (200 steps, window=60)...")
 
-    hp_result = _walk_forward_hp_dfm_rte(contracts_df, tickers, window=60, max_steps=200)
+    hp_result = _walk_forward_hp_dfm_rte(
+        contracts_df,
+        tickers,
+        cfg=model_cfg,
+        window=int(backtest_cfg.get("hp_window", 60)),
+        max_steps=int(backtest_cfg.get("hp_max_steps", 200)),
+    )
     _print_model_results("HP-DFM-RTE", hp_result)
+
+    # Persist deterministic run artifacts for baseline A/B comparison.
+    if "error" not in hp_result:
+        artifact_dir, manifest, trade_metrics = _persist_backtest_artifacts(
+            config_path=BASELINE_CONFIG_PATH,
+            backtest_cfg=backtest_cfg,
+            contracts_df=contracts_df,
+            trades=hp_result.get("trade_ledger", []),
+        )
+        print(f"\n  Baseline artifacts written to: {artifact_dir}")
+        print("  Mandatory metrics:")
+        print(f"    Total PnL (gross/net): {trade_metrics['total_pnl_gross']:+.2f}c / "
+              f"{trade_metrics['total_pnl_net']:+.2f}c")
+        print(f"    Win rate:              {trade_metrics['win_rate']:.1%}")
+        print(f"    Avg win / avg loss:    {trade_metrics['avg_win']:+.2f}c / "
+              f"{trade_metrics['avg_loss']:+.2f}c")
+        print(f"    Expectancy/trade:      {trade_metrics['expectancy_per_trade']:+.2f}c")
+        print(f"    Max drawdown:          {trade_metrics['max_drawdown']:.2f}c")
+        print(f"    Sharpe:                {trade_metrics['sharpe']:.2f}")
+        print(f"    Trade count:           {trade_metrics['trade_count']}")
+        print(f"    Exit reason histogram: {trade_metrics['exit_reason_histogram']}")
+        print(f"  Run manifest:            {artifact_dir / 'run_manifest.json'}")
+        print(f"  Trade ledger CSV:        {artifact_dir / 'trade_ledger.csv'}")
+        print(f"  Metrics JSON:            {artifact_dir / 'metrics.json'}")
+        logger.debug("Manifest details: %s", manifest)
 
     # ── TFT ──────────────────────────────────────────────────────────────
     _print_section("TFT MODEL")
     print("\n  Running walk-forward backtest (50 steps, window=80)...")
 
-    tft_result = _walk_forward_tft(contracts_df, tickers, window=80, max_steps=50)
+    tft_result = _walk_forward_tft(
+        contracts_df,
+        tickers,
+        window=int(backtest_cfg.get("tft_window", 80)),
+        max_steps=int(backtest_cfg.get("tft_max_steps", 50)),
+    )
     _print_model_results("TFT", tft_result)
 
     # ── Head-to-head ─────────────────────────────────────────────────────
