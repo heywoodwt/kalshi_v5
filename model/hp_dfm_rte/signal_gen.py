@@ -75,15 +75,21 @@ class SignalGenerator:
         self.cfg = cfg
         self._last_signal_time: dict[str, float] = {}
         self._filter_stats: dict[str, int] = {
+            "threshold_filtered": 0,
+            "cooldown_filtered": 0,
+            "price_band_filtered": 0,
+            "expected_move_filtered": 0,
+            "expiry_blackout_filtered": 0,
+            "momentum_filtered": 0,
             "price_filtered": 0,
             "z_scaled_filtered": 0,
             "magnitude_filtered": 0,
             "expiry_filtered": 0,
-            "momentum_filtered": 0,
             "vol_adaptive_filtered": 0,
             "forecast_swing_filtered": 0,
             "passed": 0,
         }
+        self._last_run_funnel: dict[str, int] = {}
 
     def evaluate(
         self,
@@ -104,6 +110,7 @@ class SignalGenerator:
         """
         now = time.monotonic()
         signals: list[Signal] = []
+        run_funnel = self._init_run_funnel()
 
         # Compute mean-reversion z-scores per ticker: how far is the current cycle
         # from zero, normalized by cycle std. Negated so that:
@@ -127,20 +134,27 @@ class SignalGenerator:
 
         # --- Entry signals ---
         for ticker, fc in forecasts.items():
+            run_funnel["candidate_events"] += 1
             z_score = z_scores[ticker]
 
             if abs(z_score) <= self.cfg.signal_threshold:
+                self._increment_filter_counters(run_funnel, "threshold_filtered")
+                self._filter_stats["threshold_filtered"] += 1
                 continue
 
             # Cooldown check
             last = self._last_signal_time.get(ticker, 0.0)
             if now - last < self.cfg.cooldown_s:
+                self._increment_filter_counters(run_funnel, "cooldown_filtered")
+                self._filter_stats["cooldown_filtered"] += 1
                 continue
 
             # --- Filter 1: Price level filter ---
             yes_price = (prices or {}).get(ticker)
             if yes_price is not None:
                 if not (self.cfg.price_filter_min <= yes_price <= self.cfg.price_filter_max):
+                    self._increment_filter_counters(run_funnel, "price_band_filtered")
+                    self._filter_stats["price_band_filtered"] += 1
                     self._filter_stats["price_filtered"] += 1
                     logger.debug(
                         "FILTERED (price) | %s | yes_price=%.1f outside [%.0f, %.0f]",
@@ -153,6 +167,7 @@ class SignalGenerator:
             if self.cfg.z_score_price_scaling and yes_price is not None:
                 scaled_threshold = self._scaled_z_threshold(yes_price)
                 if abs(z_score) <= scaled_threshold:
+                    self._increment_filter_counters(run_funnel, "z_scaled_filtered")
                     self._filter_stats["z_scaled_filtered"] += 1
                     logger.debug(
                         "FILTERED (z-scale) | %s | |z|=%.3f < scaled_thresh=%.3f (price=%.1f)",
@@ -167,6 +182,8 @@ class SignalGenerator:
                 rt_fee = round_trip_fee(price_int, price_int, maker=self.cfg.assume_maker)
                 min_profit = rt_fee * self.cfg.min_expected_move_multiple
                 if expected_move < min_profit:
+                    self._increment_filter_counters(run_funnel, "expected_move_filtered")
+                    self._filter_stats["expected_move_filtered"] += 1
                     self._filter_stats["magnitude_filtered"] += 1
                     logger.debug(
                         "FILTERED (magnitude) | %s | exp_move=%.3f < %.1f (%.1f * rt_fee=%d)",
@@ -178,6 +195,8 @@ class SignalGenerator:
                 # Edge filter - expected profit after fees must exceed min_edge_cents
                 expected_profit = expected_move - rt_fee
                 if expected_profit < self.cfg.min_edge_cents:
+                    self._increment_filter_counters(run_funnel, "expected_move_filtered")
+                    self._filter_stats["expected_move_filtered"] += 1
                     self._filter_stats["magnitude_filtered"] += 1
                     logger.debug(
                         "FILTERED (edge) | %s | exp_profit=%.3f < min_edge=%.1fc",
@@ -188,6 +207,8 @@ class SignalGenerator:
             # --- Filter 4: Expiry blackout ---
             if current_time is not None and self.cfg.expiry_blackout_minutes > 0:
                 if self._is_near_expiry(ticker, current_time):
+                    self._increment_filter_counters(run_funnel, "expiry_blackout_filtered")
+                    self._filter_stats["expiry_blackout_filtered"] += 1
                     self._filter_stats["expiry_filtered"] += 1
                     logger.debug(
                         "FILTERED (expiry) | %s | within %d min of expiry",
@@ -201,10 +222,12 @@ class SignalGenerator:
                 still_falling = all(recent[i] > recent[i + 1] for i in range(len(recent) - 1))
                 still_rising = all(recent[i] < recent[i + 1] for i in range(len(recent) - 1))
                 if z_score > 0 and still_falling:
+                    self._increment_filter_counters(run_funnel, "momentum_filtered")
                     self._filter_stats["momentum_filtered"] += 1
                     logger.debug("FILTERED (momentum) | %s | cycle still falling z=%.3f", ticker, z_score)
                     continue
                 if z_score < 0 and still_rising:
+                    self._increment_filter_counters(run_funnel, "momentum_filtered")
                     self._filter_stats["momentum_filtered"] += 1
                     logger.debug("FILTERED (momentum) | %s | cycle still rising z=%.3f", ticker, z_score)
                     continue
@@ -219,6 +242,7 @@ class SignalGenerator:
                     # Scale threshold between 0.75x (low vol) and 2.0x (high vol)
                     adaptive_threshold = self.cfg.signal_threshold * max(0.75, min(2.0, vol_ratio))
                     if abs(z_score) <= adaptive_threshold:
+                        self._increment_filter_counters(run_funnel, "vol_adaptive_filtered")
                         self._filter_stats["vol_adaptive_filtered"] += 1
                         logger.debug(
                             "FILTERED (vol-adaptive) | %s | |z|=%.3f < adaptive=%.3f (vol_ratio=%.2f)",
@@ -241,6 +265,7 @@ class SignalGenerator:
                 is_diverging = forecast_cycle > current_cycle
 
             if crosses_zero or is_diverging:
+                self._increment_filter_counters(run_funnel, "forecast_swing_filtered")
                 self._filter_stats["forecast_swing_filtered"] += 1
                 reason = "OVERSHOOT" if crosses_zero else "DIVERGING"
                 logger.debug(
@@ -250,6 +275,7 @@ class SignalGenerator:
                 continue
 
             self._filter_stats["passed"] += 1
+            run_funnel["accepted_trades"] += 1
 
             direction = (
                 SignalDirection.BUY_YES if z_score > 0 else SignalDirection.BUY_NO
@@ -301,7 +327,58 @@ class SignalGenerator:
                 signal.contracts,
             )
 
+        self._emit_funnel_report(run_funnel)
         return signals
+
+    def _init_run_funnel(self) -> dict[str, int]:
+        return {
+            "candidate_events": 0,
+            "threshold_filtered": 0,
+            "cooldown_filtered": 0,
+            "price_band_filtered": 0,
+            "z_scaled_filtered": 0,
+            "expected_move_filtered": 0,
+            "expiry_blackout_filtered": 0,
+            "momentum_filtered": 0,
+            "vol_adaptive_filtered": 0,
+            "forecast_swing_filtered": 0,
+            "accepted_trades": 0,
+        }
+
+    def _increment_filter_counters(self, run_funnel: dict[str, int], key: str) -> None:
+        run_funnel[key] += 1
+
+    def _emit_funnel_report(self, run_funnel: dict[str, int]) -> None:
+        self._last_run_funnel = dict(run_funnel)
+        candidate_events = run_funnel.get("candidate_events", 0)
+        if candidate_events <= 0:
+            return
+
+        ordered_keys = [
+            "threshold_filtered",
+            "cooldown_filtered",
+            "price_band_filtered",
+            "z_scaled_filtered",
+            "expected_move_filtered",
+            "expiry_blackout_filtered",
+            "momentum_filtered",
+            "vol_adaptive_filtered",
+            "forecast_swing_filtered",
+        ]
+        parts = []
+        for key in ordered_keys:
+            dropped = run_funnel.get(key, 0)
+            pct = (dropped / candidate_events) * 100.0
+            parts.append(f"{key}={dropped} ({pct:.1f}%)")
+        accepted = run_funnel.get("accepted_trades", 0)
+        accepted_pct = (accepted / candidate_events) * 100.0
+        logger.info(
+            "FUNNEL REPORT | candidates=%d | %s | accepted=%d (%.1f%%)",
+            candidate_events,
+            " | ".join(parts),
+            accepted,
+            accepted_pct,
+        )
 
     def _scaled_z_threshold(self, yes_price: float) -> float:
         """Require stronger z-scores for prices far from 50 cents.
@@ -392,7 +469,10 @@ class SignalGenerator:
 
     def get_filter_stats(self) -> dict[str, int]:
         """Return cumulative filter statistics."""
-        return dict(self._filter_stats)
+        stats = dict(self._filter_stats)
+        stats["last_run_candidates"] = self._last_run_funnel.get("candidate_events", 0)
+        stats["last_run_accepted"] = self._last_run_funnel.get("accepted_trades", 0)
+        return stats
 
     def _coerce_orderbook_snapshot(
         self,
