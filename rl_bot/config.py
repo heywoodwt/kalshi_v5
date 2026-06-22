@@ -51,6 +51,10 @@ ACTION_HOLD = 18
 ACTION_CLOSE_YES = 19
 ACTION_CLOSE_NO = 20
 
+# Module-level constants for decode_action (avoid re-creating RLConfig each call)
+_SIZES = (1, 3, 5)
+_OFFSETS = (0.0, 0.02, 0.04)
+
 
 def decode_action(action_id: int) -> tuple[str, int, float] | str:
     """Decode an integer action ID into its semantic meaning.
@@ -82,15 +86,15 @@ def decode_action(action_id: int) -> tuple[str, int, float] | str:
         return "close_no"
 
     # Decode buy actions (0-17)
-    # Action space: 2 directions * 3 sizes * 3 offsets = 18 actions
-    cfg = RLConfig()
-    direction_idx = action_id // 9       # 0 = yes, 1 = no
+    # Action space: 2 directions × 3 sizes × 3 offsets = 18 actions
+    # Encoding: direction_idx * 9 + size_idx * 3 + offset_idx
+    direction_idx = action_id // 9       # 0 = yes, 1 = no (9 = 3 sizes * 3 offsets)
     remainder = action_id % 9
     size_idx = remainder // 3            # 0, 1, 2
     offset_idx = remainder % 3           # 0, 1, 2
 
     direction = "yes" if direction_idx == 0 else "no"
-    size = cfg.sizes[size_idx]
-    offset = cfg.offsets[offset_idx]
+    size = _SIZES[size_idx]
+    offset = _OFFSETS[offset_idx]
 
     return (direction, size, offset)
