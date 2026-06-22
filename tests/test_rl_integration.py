@@ -1,6 +1,4 @@
 """Integration test: full lifecycle without a real WebSocket connection."""
-import numpy as np
-import pytest
 
 
 def test_full_lifecycle():

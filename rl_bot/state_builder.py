@@ -55,8 +55,8 @@ def build_state(
     if orderbook.yes_price is not None and orderbook.no_price is not None:
         # Spread = ask - bid. For Kalshi: yes_ask ~ 1 - no_price, yes_bid ~ yes_price
         # Simpler: just measure the gap
-        yes_bid = orderbook.yes_price if orderbook.yes_price is not None else 0.0
-        no_bid = orderbook.no_price if orderbook.no_price is not None else 0.0
+        yes_bid = orderbook.yes_price
+        no_bid = orderbook.no_price
         # yes_ask ~ 1 - no_bid (approximately)
         spread = max(0.0, (1.0 - no_bid) - yes_bid) if no_bid > 0 else 0.0
 
