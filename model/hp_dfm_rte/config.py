@@ -13,8 +13,32 @@ PROFILE_OVERRIDES: dict[str, dict[str, int | float | bool]] = {
         "price_filter_min": 10.0,
         "price_filter_max": 90.0,
         "expiry_blackout_minutes": 2,
-        "cooldown_s": 30,
+        "cooldown_s": 0,
         "z_score_price_scaling": False,
+        "dfm_vol_threshold": 50.0,
+    },
+    # Phase 1 + medium-impact fixes from profitability analysis:
+    # More signals (threshold 0.10), tighter profit/loss ratio (3c/6c),
+    # wider price range (10-90c), shorter blackout (2min), tighter exit z (0.1),
+    # no cooldown (wall-clock based, breaks backtests), realistic taker fees,
+    # no reversed z-scaling, raised DFM vol gate (cycles are in cent-space).
+    "profitability_v1": {
+        "signal_threshold": 0.10,
+        "profit_target_cents": 3.0,
+        "stop_loss_cents": 6.0,
+        "price_filter_min": 10.0,
+        "price_filter_max": 90.0,
+        "expiry_blackout_minutes": 2,
+        "cooldown_s": 0,
+        "z_score_price_scaling": False,
+        "assume_maker": False,
+        "exit_z_threshold": 0.1,
+        "min_price_movement_cents": 3.0,
+        "min_hold_seconds": 180.0,
+        "kalman_z_enabled": True,
+        "momentum_filter_enabled": False,
+        "adaptive_stop_loss_enabled": True,
+        "dfm_vol_threshold": 50.0,
     },
 }
 
@@ -48,8 +72,13 @@ class PipelineConfig:
     ewma_alpha: float = 0.1  # Smoothing factor; half-life ~6.6 observations
 
     # Signal thresholds
-    signal_threshold: float = 0.005  # Min signal strength (z-score)
-    cooldown_s: int = 120
+    signal_threshold: float = 0.10   # Min signal strength (z-score); was 0.005 (too strict, only ~4 signals)
+    cooldown_s: int = 0              # Was 30; 0 for backtests (wall-clock cooldown blocks everything). Set >0 for live.
+
+    # DFM cycle volatility gate: skip DFM fitting when max |cycle| exceeds this.
+    # HP cycles are in cent-space (typical range 10-30c) so the old hardcoded 5.0
+    # threshold was too low and forced persistence fallback on every step.
+    dfm_vol_threshold: float = 50.0
     min_edge_cents: float = 3.0      # Require 3c expected profit minimum
 
     # Market-making quote policy
@@ -66,14 +95,14 @@ class PipelineConfig:
     mm_base_contracts: int = 1
 
     # Signal filters
-    price_filter_min: float = 20.0   # Min yes_price (cents) to consider trading
-    price_filter_max: float = 80.0   # Max yes_price (cents) to consider trading
-    z_score_price_scaling: bool = True
+    price_filter_min: float = 10.0   # Min yes_price (cents); was 20. Trade extremes where reversion is strongest & fees lowest
+    price_filter_max: float = 90.0   # Max yes_price (cents); was 80. Same rationale
+    z_score_price_scaling: bool = False  # Was True; reversed logic was penalizing extremes where edge is highest
     min_expected_move_multiple: float = 2.0
-    expiry_blackout_minutes: int = 15
+    expiry_blackout_minutes: int = 2  # Was 15; recover ~25% of tradeable time
 
     # Momentum filter
-    momentum_filter_enabled: bool = True
+    momentum_filter_enabled: bool = False  # Was True; blocks 45/250 candidates with marginal benefit
     momentum_lookback: int = 3
 
     # Volatility-adaptive threshold
@@ -91,15 +120,35 @@ class PipelineConfig:
     monotonicity_min_spread: float = 2.0
 
     # Exit logic
-    exit_z_threshold: float = 0.5
+    exit_z_threshold: float = 0.1    # Was 0.5; tightened so z must drop near zero before exit fires
     exit_signals_enabled: bool = True
-    min_price_movement_cents: float = 1.0
+    min_price_movement_cents: float = 3.0   # Was 1.0; must exceed 2c round-trip taker fees
     holding_period_minutes: float = 20.0
-    profit_target_cents: float = 5.0
-    stop_loss_cents: float = 10.0
-    trailing_stop_cents: float = 8.0
+    profit_target_cents: float = 3.0   # Was 5.0; matches 3.2c MAE instead of overshooting it
+    stop_loss_cents: float = 6.0      # Was 10.0; fixes the 2:1 loss-to-gain asymmetry
+    trailing_stop_cents: float = 4.0   # Was 8.0; tightened proportionally with stop_loss
     trailing_stop_pct: float = 0.70
     expiry_exit_minutes: float = 2.0
+
+    # Minimum hold time: block non-critical exits (trailing, z-reversal, time, expiry)
+    # while letting profit target and stop loss through as safety valves.
+    min_hold_seconds: float = 180.0  # 3 minutes; prevents fee-churning on noisy short holds
+
+    # Scalar Kalman smoother on z-scores: dampens the 0.2-0.3 per-cycle noise
+    # that causes false entry/exit signals on 10-second data.
+    # Q = process noise (how fast true z changes between evals)
+    # R = measurement noise (how noisy each raw z observation is)
+    # Low Q/R ratio → heavier smoothing. Q=0.01, R=0.10 gives ~10:1 trust in prior.
+    kalman_z_enabled: bool = True
+    kalman_z_q: float = 0.01   # process noise variance
+    kalman_z_r: float = 0.10   # measurement noise variance
+
+    # Adaptive stop loss: tighten stop at price extremes where fees are lower
+    # At 50c: stop_loss_cents; at 20c/80c: ~60% of stop_loss_cents
+    adaptive_stop_loss_enabled: bool = True  # Was False; tighten stops at price extremes where fees are lower
+
+    # HP-only mode: skip DFM fitting and use persistence forecast directly
+    use_hp_only: bool = False
 
     # Orderbook fillability gate
     orderbook_enabled: bool = True
@@ -108,7 +157,7 @@ class PipelineConfig:
     orderbook_slippage_cents: float = 0.0
 
     # Fees
-    assume_maker: bool = True
+    assume_maker: bool = False  # Was True; use realistic taker fee assumptions
 
     # Expectancy guardrail (used by backtests / sims)
     expectancy_win_rate: float = 0.55
@@ -141,6 +190,7 @@ class PipelineConfig:
                 "stop_loss_cents": 6.0,
                 "assume_maker": False,
             },
+            "profitability_v1": {k: v for k, v in PROFILE_OVERRIDES["profitability_v1"].items()},
         }
         overrides = profiles.get(profile_name)
         if overrides is None:
@@ -186,8 +236,10 @@ class PipelineConfig:
             refit_interval_s=int(os.environ.get("REFIT_INTERVAL_S", cls.refit_interval_s)),
             use_ewma=os.environ.get("USE_EWMA", "false").lower() in ("true", "1", "yes"),
             ewma_alpha=float(os.environ.get("EWMA_ALPHA", cls.ewma_alpha)),
+            use_hp_only=os.environ.get("USE_HP_ONLY", "false").lower() in ("true", "1", "yes"),
             signal_threshold=float(os.environ.get("SIGNAL_THRESHOLD", cls.signal_threshold)),
             cooldown_s=int(os.environ.get("COOLDOWN_S", cls.cooldown_s)),
+            dfm_vol_threshold=float(os.environ.get("DFM_VOL_THRESHOLD", cls.dfm_vol_threshold)),
             min_edge_cents=float(os.environ.get("MIN_EDGE_CENTS", cls.min_edge_cents)),
             mm_enabled=os.environ.get("MM_ENABLED", "true").lower() in ("true", "1", "yes"),
             mm_tft_weight=float(os.environ.get("MM_TFT_WEIGHT", cls.mm_tft_weight)),
@@ -202,10 +254,10 @@ class PipelineConfig:
             mm_base_contracts=int(os.environ.get("MM_BASE_CONTRACTS", cls.mm_base_contracts)),
             price_filter_min=float(os.environ.get("PRICE_FILTER_MIN", cls.price_filter_min)),
             price_filter_max=float(os.environ.get("PRICE_FILTER_MAX", cls.price_filter_max)),
-            z_score_price_scaling=os.environ.get("Z_SCORE_PRICE_SCALING", "true").lower() in ("true", "1", "yes"),
+            z_score_price_scaling=os.environ.get("Z_SCORE_PRICE_SCALING", "false").lower() in ("true", "1", "yes"),
             min_expected_move_multiple=float(os.environ.get("MIN_EXPECTED_MOVE_MULTIPLE", cls.min_expected_move_multiple)),
             expiry_blackout_minutes=int(os.environ.get("EXPIRY_BLACKOUT_MINUTES", cls.expiry_blackout_minutes)),
-            momentum_filter_enabled=os.environ.get("MOMENTUM_FILTER_ENABLED", "true").lower() in ("true", "1", "yes"),
+            momentum_filter_enabled=os.environ.get("MOMENTUM_FILTER_ENABLED", "false").lower() in ("true", "1", "yes"),
             momentum_lookback=int(os.environ.get("MOMENTUM_LOOKBACK", cls.momentum_lookback)),
             vol_adaptive_threshold_enabled=os.environ.get("VOL_ADAPTIVE_THRESHOLD_ENABLED", "true").lower() in ("true", "1", "yes"),
             vol_short_period=int(os.environ.get("VOL_SHORT_PERIOD", cls.vol_short_period)),
@@ -224,11 +276,16 @@ class PipelineConfig:
             trailing_stop_cents=float(os.environ.get("TRAILING_STOP_CENTS", cls.trailing_stop_cents)),
             trailing_stop_pct=float(os.environ.get("TRAILING_STOP_PCT", cls.trailing_stop_pct)),
             expiry_exit_minutes=float(os.environ.get("EXPIRY_EXIT_MINUTES", cls.expiry_exit_minutes)),
+            min_hold_seconds=float(os.environ.get("MIN_HOLD_SECONDS", cls.min_hold_seconds)),
+            kalman_z_enabled=os.environ.get("KALMAN_Z_ENABLED", "true").lower() in ("true", "1", "yes"),
+            kalman_z_q=float(os.environ.get("KALMAN_Z_Q", cls.kalman_z_q)),
+            kalman_z_r=float(os.environ.get("KALMAN_Z_R", cls.kalman_z_r)),
+            adaptive_stop_loss_enabled=os.environ.get("ADAPTIVE_STOP_LOSS_ENABLED", "true").lower() in ("true", "1", "yes"),
             orderbook_enabled=os.environ.get("ORDERBOOK_ENABLED", "true").lower() in ("true", "1", "yes"),
             orderbook_max_age_s=int(os.environ.get("ORDERBOOK_MAX_AGE_S", cls.orderbook_max_age_s)),
             orderbook_min_size=int(os.environ.get("ORDERBOOK_MIN_SIZE", cls.orderbook_min_size)),
             orderbook_slippage_cents=float(os.environ.get("ORDERBOOK_SLIPPAGE_CENTS", cls.orderbook_slippage_cents)),
-            assume_maker=os.environ.get("ASSUME_MAKER", "true").lower() in ("true", "1", "yes"),
+            assume_maker=os.environ.get("ASSUME_MAKER", "false").lower() in ("true", "1", "yes"),
             expectancy_win_rate=float(os.environ.get("EXPECTANCY_WIN_RATE", cls.expectancy_win_rate)),
             expectancy_avg_win_cents=float(os.environ.get("EXPECTANCY_AVG_WIN_CENTS", cls.expectancy_avg_win_cents)),
             expectancy_avg_loss_cents=float(os.environ.get("EXPECTANCY_AVG_LOSS_CENTS", cls.expectancy_avg_loss_cents)),

@@ -53,20 +53,25 @@ class Signal:
     orderbook_age_s: float | None = None
 
 
-# Regex to extract expiry hour from common Kalshi BTC ticker formats:
-#   KXBTC-26MAR2123-B69050    -> hour 21 (from "2123")
-#   KXBTCD-26MAR2123-T69399.99 -> hour 21
-#   KXBTC15M-26MAR212315-15   -> hour 21
-_EXPIRY_HOUR_RE = re.compile(
-    r"KXBTC\w*-\d{2}[A-Z]{3}(\d{2})(\d{2})"
+# Regex to extract expiry time from Kalshi BTC ticker format: YYMONDDHH[MM]
+#   KXBTC-26JUN2109-B63950      -> day=21, hour=09, min=00
+#   KXBTCD-26JUN2617-T63499.99  -> day=26, hour=17, min=00
+#   KXBTC15M-26JUN210830-30     -> day=21, hour=08, min=30
+_EXPIRY_RE = re.compile(
+    r"KXBTC\w*-\d{2}[A-Z]{3}(\d{2})(\d{2})(\d{2})?"
 )
 
 
 def _parse_expiry_hour_minute(ticker: str) -> tuple[int, int] | None:
     """Extract (hour, minute) from a Kalshi BTC ticker, or None if unparseable."""
-    m = _EXPIRY_HOUR_RE.search(ticker)
+    m = _EXPIRY_RE.search(ticker)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        # group(1) = day (unused; same-day check via replace() handles it)
+        # group(2) = hour, group(3) = optional minute
+        hour = int(m.group(2))
+        minute = int(m.group(3)) if m.group(3) else 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
     return None
 
 
@@ -90,6 +95,49 @@ class SignalGenerator:
             "passed": 0,
         }
         self._last_run_funnel: dict[str, int] = {}
+
+        # Per-ticker scalar Kalman state for z-score smoothing.
+        # Each entry: (x_hat, P) where x_hat is the filtered z estimate
+        # and P is the error covariance (scalar).
+        self._kalman_z: dict[str, tuple[float, float]] = {}
+
+    def _kalman_smooth_z(self, raw_z: dict[str, float]) -> dict[str, float]:
+        """Apply a scalar Kalman filter to each ticker's z-score.
+
+        Predict step:  x_pred = x_hat,  P_pred = P + Q
+        Update step:   K = P_pred / (P_pred + R),  x_hat = x_pred + K*(z - x_pred),  P = (1-K)*P_pred
+
+        First observation initializes state to the raw value with P = R.
+        Returns smoothed z-scores.
+        """
+        if not self.cfg.kalman_z_enabled:
+            return raw_z
+
+        q = self.cfg.kalman_z_q
+        r = self.cfg.kalman_z_r
+        smoothed: dict[str, float] = {}
+
+        for ticker, z in raw_z.items():
+            if ticker not in self._kalman_z:
+                # Initialize: trust the first observation fully
+                self._kalman_z[ticker] = (z, r)
+                smoothed[ticker] = z
+                continue
+
+            x_hat, p = self._kalman_z[ticker]
+
+            # Predict (constant-velocity model: x stays put)
+            p_pred = p + q
+
+            # Update
+            k = p_pred / (p_pred + r)  # Kalman gain
+            x_new = x_hat + k * (z - x_hat)
+            p_new = (1.0 - k) * p_pred
+
+            self._kalman_z[ticker] = (x_new, p_new)
+            smoothed[ticker] = x_new
+
+        return smoothed
 
     def evaluate(
         self,
@@ -116,9 +164,12 @@ class SignalGenerator:
         # from zero, normalized by cycle std. Negated so that:
         #   z > 0  <=>  cycle < 0  (price below trend) -> BUY_YES (expect reversion up)
         #   z < 0  <=>  cycle > 0  (price above trend) -> BUY_NO  (expect reversion down)
-        z_scores: dict[str, float] = {}
+        z_scores_raw: dict[str, float] = {}
         for ticker, fc in forecasts.items():
-            z_scores[ticker] = -fc.current_cycle / fc.residual_std
+            z_scores_raw[ticker] = -fc.current_cycle / fc.residual_std
+
+        # Kalman-smooth the z-scores to dampen per-cycle noise
+        z_scores = self._kalman_smooth_z(z_scores_raw)
 
         # --- Exit signals (evaluated first so entries don't conflict) ---
         if self.cfg.exit_signals_enabled and open_positions:
@@ -595,19 +646,21 @@ class SignalGenerator:
                     continue
 
             # Fall back to ticker prices when we do not have a fresh, deep book.
-            used_fallback = current_side_price is None
             if current_side_price is None:
                 current_side_price = (prices or {}).get(ticker)
-                if current_side_price is None:
-                    # No live price, so approximate the mark using the entry price.
-                    current_side_price = entry_price
+            # True only when NEITHER orderbook NOR prices dict has a value
+            is_missing_price = current_side_price is None
+            if current_side_price is None:
+                # No live price, so approximate the mark using the entry price.
+                current_side_price = entry_price
             price_for_pnl = cast(float, float(current_side_price))
 
-            # Calculate unrealized P&L (cents, before fees)
+            # Calculate unrealized P&L (cents, after fees)
             price_change = price_for_pnl - entry_price
 
-            # Estimate fees (2c round-trip for typical prices)
-            estimated_fees = 2.0
+            # Use actual fee schedule based on entry price; exit price estimated at entry
+            entry_cents = max(1, min(99, int(round(entry_price))))
+            estimated_fees = round_trip_fee(entry_cents, entry_cents, contracts=contracts, maker=self.cfg.assume_maker)
             unrealized_pnl = price_change - estimated_fees
 
             # Don't emit an exit unless the book or price moved enough to justify fees.
@@ -617,7 +670,6 @@ class SignalGenerator:
             if minutes_to_expiry is not None:
                 expiry_minutes = float(minutes_to_expiry)
                 is_near_expiry = expiry_minutes <= float(self.cfg.expiry_exit_minutes)
-            is_missing_price = used_fallback
 
             if abs(price_change) < self.cfg.min_price_movement_cents and not is_near_expiry and not is_missing_price:
                 logger.debug(
@@ -649,6 +701,13 @@ class SignalGenerator:
             exit_reason = None
             exit_dir = SignalDirection.SELL_YES if direction == "BUY_YES" else SignalDirection.SELL_NO
 
+            # Adaptive stop: tighten at price extremes where fees are lower
+            stop_threshold = (
+                self._adaptive_stop_loss(entry_price)
+                if self.cfg.adaptive_stop_loss_enabled
+                else self.cfg.stop_loss_cents
+            )
+
             # EXIT 0: Missing Price (likely expired/delisted contract)
             if is_missing_price:
                 exit_reason = "MISSING_PRICE"
@@ -666,12 +725,17 @@ class SignalGenerator:
                 )
 
             # EXIT 2: Stop Loss
-            elif unrealized_pnl <= -self.cfg.stop_loss_cents:
+            elif unrealized_pnl <= -stop_threshold:
                 exit_reason = "STOP_LOSS"
                 logger.warning(
-                    "EXIT SIGNAL (STOP) | %s | %s | loss=%.1fc | held=%.1fmin",
-                    exit_dir.value, ticker, float(unrealized_pnl), float(holding_minutes),
+                    "EXIT SIGNAL (STOP) | %s | %s | loss=%.1fc | stop=%.1fc | held=%.1fmin",
+                    exit_dir.value, ticker, float(unrealized_pnl), float(stop_threshold), float(holding_minutes),
                 )
+
+            # MIN-HOLD GUARD: block non-critical exits while position is too young.
+            # Profit target and stop loss (above) still fire as safety valves.
+            elif (holding_minutes * 60.0) < self.cfg.min_hold_seconds:
+                pass  # position too young for trailing/z/time/expiry exits
 
             # EXIT 3: Trailing Stop
             elif peak_profit >= self.cfg.trailing_stop_cents:
@@ -738,6 +802,20 @@ class SignalGenerator:
                 exit_signals.append(signal)
 
         return exit_signals
+
+    def _adaptive_stop_loss(self, yes_price: float) -> float:
+        """Compute adaptive stop loss in cents based on price distance from 50c.
+
+        Fees are proportional to price*(1-price), so they are lower at extremes.
+        Aligns max dollar-loss with fee-adjusted risk:
+          At 50c: full stop_loss_cents (fees ~3.5c)
+          At 30c/70c: ~83% of stop (fees ~2.9c)
+          At 20c/80c: ~67% of stop (fees ~2.2c)
+        """
+        distance = abs(yes_price - 50.0) / 30.0  # 0 at 50c, 1 at 20c/80c
+        distance = min(distance, 1.0)
+        scale = 1.0 - 0.33 * distance  # 1.0x at center, 0.67x at edges
+        return self.cfg.stop_loss_cents * scale
 
     def _minutes_to_expiry(self, ticker: str, current_time: datetime) -> float | None:
         """Calculate minutes until contract expiry."""
