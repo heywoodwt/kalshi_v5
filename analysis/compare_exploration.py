@@ -152,16 +152,16 @@ def generate_summary_table(results: dict, output_dir: Path) -> None:
         parts = exp_name.replace("exp_", "").split("_")
 
         # Strategy name is everything except last part (held/no_held)
-        if parts[-1] in ["held", "no"]:
-            if parts[-1] == "no" and len(parts) > 1 and parts[-2] == "held":
-                # "no_held" case
-                strategy = "_".join(parts[:-2])
-                held = "No"
-            else:
-                # "held" case
-                strategy = "_".join(parts[:-1])
-                held = "Yes"
+        if len(parts) >= 2 and parts[-1] == "held" and parts[-2] == "no":
+            # "no_held" case: exp_fast_linear_no_held -> strategy="fast_linear", held="No"
+            strategy = "_".join(parts[:-2])
+            held = "No"
+        elif parts[-1] == "held":
+            # "held" case: exp_fast_linear_held -> strategy="fast_linear", held="Yes"
+            strategy = "_".join(parts[:-1])
+            held = "Yes"
         else:
+            # Unknown format
             strategy = "_".join(parts)
             held = "Unknown"
 
