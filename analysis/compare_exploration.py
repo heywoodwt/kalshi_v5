@@ -12,6 +12,9 @@ Usage:
 import argparse
 from pathlib import Path
 import polars as pl
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for HPC
+import matplotlib.pyplot as plt
 
 # Threshold for filtering near-zero rewards to identify actual trades.
 # Rewards below this magnitude are treated as no-op/holding actions.
@@ -253,6 +256,226 @@ def generate_summary_table(results: dict, output_dir: Path) -> None:
     print(f"Summary CSV saved: {csv_path}")
 
 
+def plot_pnl_comparison(results: dict, output_dir: Path) -> None:
+    """Plot cumulative PnL curves for all experiments.
+
+    X-axis: Training steps
+    Y-axis: Cumulative PnL ($)
+    Lines: color-coded by strategy, dashed=no_held, solid=held
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Color map for strategies
+    colors = {
+        "fast_linear": "blue",
+        "exponential": "red",
+        "logarithmic": "green",
+        "episode": "orange",
+        "action_local": "purple",
+        "parameter_noise": "brown",
+    }
+
+    for exp_name, metrics in results.items():
+        # Parse strategy name
+        strategy = exp_name.replace("exp_", "").split("_")[0]
+        if strategy == "action":
+            strategy = "action_local"
+        if strategy == "parameter":
+            strategy = "parameter_noise"
+
+        held = "held" in exp_name and "no_held" not in exp_name
+
+        steps, pnls = zip(*metrics["pnl_curve"])
+
+        ax.plot(
+            steps, pnls,
+            label=f"{strategy} ({'held' if held else 'no held'})",
+            color=colors.get(strategy, "gray"),
+            linestyle="-" if held else "--",
+            alpha=0.8,
+        )
+
+    ax.set_xlabel("Training Steps")
+    ax.set_ylabel("Cumulative PnL ($)")
+    ax.set_title("Exploration Strategy PnL Comparison")
+    ax.axhline(0, color="black", linestyle=":", alpha=0.5)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out_path = output_dir / "pnl_comparison.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"PnL plot saved: {out_path}")
+
+
+def plot_epsilon_trajectories(results: dict, output_dir: Path) -> None:
+    """Plot epsilon decay curves for all strategies.
+
+    X-axis: Training steps
+    Y-axis: Epsilon (exploration rate)
+    Lines: one per strategy (averaged across held/no_held variants)
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    colors = {
+        "fast_linear": "blue",
+        "exponential": "red",
+        "logarithmic": "green",
+        "episode": "orange",
+        "action_local": "purple",
+        "parameter_noise": "brown",
+    }
+
+    # Group by strategy (average held + no_held)
+    by_strategy = {}
+    for exp_name, metrics in results.items():
+        strategy = exp_name.replace("exp_", "").split("_")[0]
+        if strategy == "action":
+            strategy = "action_local"
+        if strategy == "parameter":
+            strategy = "parameter_noise"
+
+        if strategy not in by_strategy:
+            by_strategy[strategy] = []
+        by_strategy[strategy].append(metrics["epsilon_curve"])
+
+    for strategy, curves in by_strategy.items():
+        # Use first curve (they should be identical for same strategy)
+        steps, eps_values = zip(*curves[0])
+        ax.plot(
+            steps, eps_values,
+            label=strategy,
+            color=colors.get(strategy, "gray"),
+            linewidth=2,
+        )
+
+    ax.set_xlabel("Training Steps")
+    ax.set_ylabel("Epsilon (exploration rate)")
+    ax.set_title("Epsilon Decay Trajectories")
+    ax.axhline(0.05, color="black", linestyle=":", alpha=0.5, label="Floor (0.05)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out_path = output_dir / "epsilon_decay.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Epsilon plot saved: {out_path}")
+
+
+def plot_trade_frequency(results: dict, output_dir: Path) -> None:
+    """Plot trade frequency over training (rolling window).
+
+    X-axis: Training progress (0-100%)
+    Y-axis: Trades per 100 steps (rolling window)
+    Shows when each strategy stops exploring and trades decline.
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    window_size = 100  # rolling window for smoothing
+
+    colors = {
+        "fast_linear": "blue",
+        "exponential": "red",
+        "logarithmic": "green",
+        "episode": "orange",
+        "action_local": "purple",
+        "parameter_noise": "brown",
+    }
+
+    for exp_name, metrics in results.items():
+        strategy = exp_name.replace("exp_", "").split("_")[0]
+        if strategy == "action":
+            strategy = "action_local"
+        if strategy == "parameter":
+            strategy = "parameter_noise"
+
+        held = "held" in exp_name and "no_held" not in exp_name
+
+        df = metrics["df"]
+        max_step = df["step"].max()
+
+        # Compute rolling trade frequency
+        df = df.with_columns(
+            (pl.col("reward").abs() > 1e-9).cast(pl.Int32).alias("is_trade")
+        )
+
+        # Group into buckets of window_size steps
+        df = df.with_columns(
+            (pl.col("step") // window_size).alias("bucket")
+        )
+
+        freq = df.group_by("bucket").agg(
+            pl.col("is_trade").sum().alias("trades_per_window")
+        ).sort("bucket")
+
+        # Convert bucket to progress %
+        progress = (freq["bucket"] * window_size / max_step * 100).to_list()
+        trades = freq["trades_per_window"].to_list()
+
+        ax.plot(
+            progress, trades,
+            label=f"{strategy} ({'held' if held else 'no held'})",
+            color=colors.get(strategy, "gray"),
+            linestyle="-" if held else "--",
+            alpha=0.7,
+        )
+
+    ax.set_xlabel("Training Progress (%)")
+    ax.set_ylabel(f"Trades per {window_size} steps")
+    ax.set_title("Trade Frequency During Training")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out_path = output_dir / "trade_frequency.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Trade frequency plot saved: {out_path}")
+
+
+def plot_cost_per_trade(results: dict, output_dir: Path) -> None:
+    """Bar chart: average cost per trade for each experiment.
+
+    X-axis: Experiment names
+    Y-axis: Avg cost per trade ($)
+    Sorted by cost (lowest first = most efficient)
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Extract data
+    names = []
+    costs = []
+    for exp_name, metrics in results.items():
+        names.append(exp_name.replace("exp_", "").replace("_", " "))
+        costs.append(metrics["avg_cost_per_trade"])
+
+    # Sort by cost (ascending - best first)
+    sorted_pairs = sorted(zip(names, costs), key=lambda x: x[1])
+    names, costs = zip(*sorted_pairs)
+
+    # Color bars by cost (red=expensive, orange=medium, green=cheap)
+    colors_list = [
+        "red" if c < -0.10 else "orange" if c < -0.05 else "green"
+        for c in costs
+    ]
+
+    ax.barh(names, costs, color=colors_list, alpha=0.7)
+    ax.set_xlabel("Avg Cost per Trade ($)")
+    ax.set_title("Exploration Cost Efficiency")
+    ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
+    ax.axvline(-0.12, color="gray", linestyle=":", alpha=0.5, label="Baseline (-$0.12)")
+    ax.legend()
+    ax.grid(axis="x", alpha=0.3)
+
+    plt.tight_layout()
+    out_path = output_dir / "cost_per_trade.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Cost efficiency plot saved: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare exploration strategy experiments"
@@ -280,7 +503,19 @@ def main():
     print("Generating summary table...")
     generate_summary_table(results, output_dir)
 
-    print("\nPlotting functions to be added in next tasks...")
+    print("\nGenerating plots...")
+    plot_pnl_comparison(results, output_dir)
+    plot_epsilon_trajectories(results, output_dir)
+    plot_trade_frequency(results, output_dir)
+    plot_cost_per_trade(results, output_dir)
+
+    print(f"\nAnalysis complete! Results in {output_dir}/")
+    print(f"  - summary_table.md")
+    print(f"  - summary_table.csv")
+    print(f"  - pnl_comparison.png")
+    print(f"  - epsilon_decay.png")
+    print(f"  - trade_frequency.png")
+    print(f"  - cost_per_trade.png")
 
 
 if __name__ == "__main__":
