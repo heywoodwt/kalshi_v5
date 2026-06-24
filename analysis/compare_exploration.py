@@ -25,6 +25,51 @@ TRADE_REWARD_THRESHOLD = 1e-9
 # precision and ensure we capture all rows that have reached the floor.
 EPSILON_FLOOR_THRESHOLD = 0.051
 
+# Color map for strategies used across all plotting functions.
+# Maps strategy name to consistent color for visual consistency.
+STRATEGY_COLORS = {
+    "fast_linear": "blue",
+    "exponential": "red",
+    "logarithmic": "green",
+    "episode": "orange",
+    "action_local": "purple",
+    "parameter_noise": "brown",
+}
+
+
+def _parse_strategy_name(exp_name: str) -> str:
+    """Extract canonical strategy name from experiment name.
+
+    Normalizes multi-word strategy names (action_local, parameter_noise)
+    by converting their shortened prefixes back to full names.
+
+    Args:
+        exp_name: Experiment name like "exp_fast_linear_held"
+
+    Returns:
+        Canonical strategy name like "fast_linear" or "action_local"
+
+    Examples:
+        exp_fast_linear_held -> fast_linear
+        exp_exponential_no_held -> exponential
+        exp_action_local_held -> action_local
+    """
+    # Parse experiment name: exp_<strategy>_<held|no_held>
+    parts = exp_name.replace("exp_", "").split("_")
+
+    # Strategy name is everything except last part (held/no_held)
+    if len(parts) >= 2 and parts[-1] == "held" and parts[-2] == "no":
+        # "no_held" case: exp_fast_linear_no_held -> strategy="fast_linear"
+        strategy = "_".join(parts[:-2])
+    elif parts[-1] == "held":
+        # "held" case: exp_fast_linear_held -> strategy="fast_linear"
+        strategy = "_".join(parts[:-1])
+    else:
+        # Unknown format - return as-is
+        strategy = "_".join(parts)
+
+    return strategy
+
 
 def load_experiment_results(csv_dir: Path) -> dict[str, dict]:
     """Load all experiment CSVs and compute summary metrics.
@@ -263,34 +308,33 @@ def plot_pnl_comparison(results: dict, output_dir: Path) -> None:
     Y-axis: Cumulative PnL ($)
     Lines: color-coded by strategy, dashed=no_held, solid=held
     """
+    # Validate results is non-empty
+    if not results:
+        raise ValueError(
+            "Cannot plot PnL comparison: results dict is empty. "
+            "Ensure experiment CSVs were loaded successfully."
+        )
+
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Color map for strategies
-    colors = {
-        "fast_linear": "blue",
-        "exponential": "red",
-        "logarithmic": "green",
-        "episode": "orange",
-        "action_local": "purple",
-        "parameter_noise": "brown",
-    }
-
     for exp_name, metrics in results.items():
-        # Parse strategy name
-        strategy = exp_name.replace("exp_", "").split("_")[0]
-        if strategy == "action":
-            strategy = "action_local"
-        if strategy == "parameter":
-            strategy = "parameter_noise"
-
+        # Parse strategy name using helper function
+        strategy = _parse_strategy_name(exp_name)
         held = "held" in exp_name and "no_held" not in exp_name
+
+        # Validate pnl_curve is non-empty before unpacking
+        if not metrics["pnl_curve"]:
+            raise ValueError(
+                f"Cannot plot PnL for '{exp_name}': pnl_curve is empty. "
+                f"Check that the CSV contains valid step and cumulative_pnl data."
+            )
 
         steps, pnls = zip(*metrics["pnl_curve"])
 
         ax.plot(
             steps, pnls,
             label=f"{strategy} ({'held' if held else 'no held'})",
-            color=colors.get(strategy, "gray"),
+            color=STRATEGY_COLORS.get(strategy, "gray"),
             linestyle="-" if held else "--",
             alpha=0.8,
         )
@@ -316,37 +360,38 @@ def plot_epsilon_trajectories(results: dict, output_dir: Path) -> None:
     Y-axis: Epsilon (exploration rate)
     Lines: one per strategy (averaged across held/no_held variants)
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # Validate results is non-empty
+    if not results:
+        raise ValueError(
+            "Cannot plot epsilon trajectories: results dict is empty. "
+            "Ensure experiment CSVs were loaded successfully."
+        )
 
-    colors = {
-        "fast_linear": "blue",
-        "exponential": "red",
-        "logarithmic": "green",
-        "episode": "orange",
-        "action_local": "purple",
-        "parameter_noise": "brown",
-    }
+    fig, ax = plt.subplots(figsize=(10, 6))
 
     # Group by strategy (average held + no_held)
     by_strategy = {}
     for exp_name, metrics in results.items():
-        strategy = exp_name.replace("exp_", "").split("_")[0]
-        if strategy == "action":
-            strategy = "action_local"
-        if strategy == "parameter":
-            strategy = "parameter_noise"
+        strategy = _parse_strategy_name(exp_name)
 
         if strategy not in by_strategy:
             by_strategy[strategy] = []
         by_strategy[strategy].append(metrics["epsilon_curve"])
 
     for strategy, curves in by_strategy.items():
+        # Validate epsilon_curve is non-empty before unpacking
+        if not curves or not curves[0]:
+            raise ValueError(
+                f"Cannot plot epsilon for strategy '{strategy}': epsilon_curve is empty. "
+                f"Check that the CSV contains valid step and epsilon data."
+            )
+
         # Use first curve (they should be identical for same strategy)
         steps, eps_values = zip(*curves[0])
         ax.plot(
             steps, eps_values,
             label=strategy,
-            color=colors.get(strategy, "gray"),
+            color=STRATEGY_COLORS.get(strategy, "gray"),
             linewidth=2,
         )
 
@@ -371,34 +416,34 @@ def plot_trade_frequency(results: dict, output_dir: Path) -> None:
     Y-axis: Trades per 100 steps (rolling window)
     Shows when each strategy stops exploring and trades decline.
     """
+    # Validate results is non-empty
+    if not results:
+        raise ValueError(
+            "Cannot plot trade frequency: results dict is empty. "
+            "Ensure experiment CSVs were loaded successfully."
+        )
+
     fig, ax = plt.subplots(figsize=(12, 6))
 
     window_size = 100  # rolling window for smoothing
 
-    colors = {
-        "fast_linear": "blue",
-        "exponential": "red",
-        "logarithmic": "green",
-        "episode": "orange",
-        "action_local": "purple",
-        "parameter_noise": "brown",
-    }
-
     for exp_name, metrics in results.items():
-        strategy = exp_name.replace("exp_", "").split("_")[0]
-        if strategy == "action":
-            strategy = "action_local"
-        if strategy == "parameter":
-            strategy = "parameter_noise"
-
+        strategy = _parse_strategy_name(exp_name)
         held = "held" in exp_name and "no_held" not in exp_name
 
         df = metrics["df"]
+
+        # Validate df is non-empty
+        if df.height == 0:
+            raise ValueError(
+                f"Cannot plot trade frequency for '{exp_name}': DataFrame is empty. "
+                f"Check that the CSV contains valid data."
+            )
         max_step = df["step"].max()
 
         # Compute rolling trade frequency
         df = df.with_columns(
-            (pl.col("reward").abs() > 1e-9).cast(pl.Int32).alias("is_trade")
+            (pl.col("reward").abs() > TRADE_REWARD_THRESHOLD).cast(pl.Int32).alias("is_trade")
         )
 
         # Group into buckets of window_size steps
@@ -417,7 +462,7 @@ def plot_trade_frequency(results: dict, output_dir: Path) -> None:
         ax.plot(
             progress, trades,
             label=f"{strategy} ({'held' if held else 'no held'})",
-            color=colors.get(strategy, "gray"),
+            color=STRATEGY_COLORS.get(strategy, "gray"),
             linestyle="-" if held else "--",
             alpha=0.7,
         )
@@ -442,6 +487,13 @@ def plot_cost_per_trade(results: dict, output_dir: Path) -> None:
     Y-axis: Avg cost per trade ($)
     Sorted by cost (lowest first = most efficient)
     """
+    # Validate results is non-empty
+    if not results:
+        raise ValueError(
+            "Cannot plot cost per trade: results dict is empty. "
+            "Ensure experiment CSVs were loaded successfully."
+        )
+
     fig, ax = plt.subplots(figsize=(12, 6))
 
     # Extract data
@@ -450,6 +502,13 @@ def plot_cost_per_trade(results: dict, output_dir: Path) -> None:
     for exp_name, metrics in results.items():
         names.append(exp_name.replace("exp_", "").replace("_", " "))
         costs.append(metrics["avg_cost_per_trade"])
+
+    # Validate we have data to plot
+    if not names or not costs:
+        raise ValueError(
+            "Cannot plot cost per trade: no valid data extracted from results. "
+            "Check that experiments contain avg_cost_per_trade metrics."
+        )
 
     # Sort by cost (ascending - best first)
     sorted_pairs = sorted(zip(names, costs), key=lambda x: x[1])
