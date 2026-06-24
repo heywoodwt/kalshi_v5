@@ -136,6 +136,75 @@ def load_experiment_results(csv_dir: Path) -> dict[str, dict]:
     return results
 
 
+def generate_summary_table(results: dict, output_dir: Path) -> None:
+    """Generate markdown and CSV summary tables.
+
+    Columns: Strategy, Held?, Total PnL, Trades, Avg Cost, Final ε, Steps to 0.05
+    Sorted by: Total PnL (best first)
+
+    Args:
+        results: Dict from load_experiment_results()
+        output_dir: Directory to save tables
+    """
+    rows = []
+    for exp_name, metrics in results.items():
+        # Parse experiment name: exp_<strategy>_<held|no_held>
+        parts = exp_name.replace("exp_", "").split("_")
+
+        # Strategy name is everything except last part (held/no_held)
+        if parts[-1] in ["held", "no"]:
+            if parts[-1] == "no" and len(parts) > 1 and parts[-2] == "held":
+                # "no_held" case
+                strategy = "_".join(parts[:-2])
+                held = "No"
+            else:
+                # "held" case
+                strategy = "_".join(parts[:-1])
+                held = "Yes"
+        else:
+            strategy = "_".join(parts)
+            held = "Unknown"
+
+        rows.append({
+            "Strategy": strategy,
+            "Held?": held,
+            "Total PnL": f"${metrics['total_pnl']:.2f}",
+            "Trades": metrics["total_trades"],
+            "Avg Cost": f"${metrics['avg_cost_per_trade']:.3f}",
+            "Final ε": f"{metrics['final_epsilon']:.3f}",
+            "Steps to 0.05": metrics["steps_until_eps_05"],
+        })
+
+    # Sort by PnL (descending - best first)
+    rows.sort(
+        key=lambda r: float(r["Total PnL"].replace("$", "")),
+        reverse=True
+    )
+
+    # Write markdown
+    md_path = output_dir / "summary_table.md"
+    with open(md_path, "w") as f:
+        # Header
+        f.write("# Exploration Strategy Comparison\n\n")
+        f.write("| Strategy | Held? | Total PnL | Trades | Avg Cost | Final ε | Steps to 0.05 |\n")
+        f.write("|----------|-------|-----------|--------|----------|---------|---------------|\n")
+
+        # Rows
+        for row in rows:
+            f.write(
+                f"| {row['Strategy']} | {row['Held?']} | {row['Total PnL']} | "
+                f"{row['Trades']} | {row['Avg Cost']} | {row['Final ε']} | "
+                f"{row['Steps to 0.05']} |\n"
+            )
+
+    # Write CSV
+    csv_path = output_dir / "summary_table.csv"
+    pl.DataFrame(rows).write_csv(csv_path)
+
+    print(f"Summary table saved: {md_path}")
+    print(f"Summary CSV saved: {csv_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare exploration strategy experiments"
@@ -160,8 +229,10 @@ def main():
     results = load_experiment_results(csv_dir)
     print(f"Loaded {len(results)} experiments\n")
 
-    # Placeholder for next steps
-    print("Analysis functions to be added in next tasks...")
+    print("Generating summary table...")
+    generate_summary_table(results, output_dir)
+
+    print("\nPlotting functions to be added in next tasks...")
 
 
 if __name__ == "__main__":
