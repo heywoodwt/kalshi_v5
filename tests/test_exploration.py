@@ -261,3 +261,66 @@ def test_parameter_noise_decay():
     # At step 100+
     assert strategy._noise_std(100) == 0.01
     assert strategy._noise_std(200) == 0.01
+
+
+def test_agent_with_strategy():
+    """Verify DQNAgent accepts and uses exploration strategy."""
+    from rl_bot.agent import DQNAgent
+    from rl_bot.config import RLConfig
+
+    cfg = RLConfig(
+        state_dim=18,
+        n_actions=21,
+        hidden_dim=64,
+        dueling_dim=32,
+        seed=42,
+    )
+
+    strategy = FastLinearDecay({
+        "eps_start": 0.8,
+        "eps_end": 0.05,
+        "decay_steps": 100,
+    })
+
+    agent = DQNAgent(cfg, exploration_strategy=strategy)
+
+    # Epsilon should come from strategy
+    assert agent.epsilon() == 0.8
+
+    # After 50 steps
+    agent.step_count = 50
+    assert agent.epsilon() == pytest.approx(0.425)
+
+    # Action selection should use strategy
+    state = np.random.randn(18).astype(np.float32)
+    valid_mask = np.ones(21)
+    action = agent.select_action(state, valid_mask)
+    assert 0 <= action < 21
+
+
+def test_agent_without_strategy_backward_compatible():
+    """Verify DQNAgent works without strategy (legacy behavior)."""
+    from rl_bot.agent import DQNAgent
+    from rl_bot.config import RLConfig
+
+    cfg = RLConfig(
+        state_dim=18,
+        n_actions=21,
+        eps_start=1.0,
+        eps_end=0.05,
+        eps_decay_steps=100,
+        seed=42,
+    )
+
+    agent = DQNAgent(cfg)  # no strategy
+
+    # Epsilon should use legacy linear decay from config
+    assert agent.epsilon() == 1.0
+    agent.step_count = 50
+    assert agent.epsilon() == pytest.approx(0.525)
+
+    # Action selection should work
+    state = np.random.randn(18).astype(np.float32)
+    valid_mask = np.ones(21)
+    action = agent.select_action(state, valid_mask)
+    assert 0 <= action < 21
