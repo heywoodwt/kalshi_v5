@@ -145,9 +145,37 @@ def generate_summary_table(results: dict, output_dir: Path) -> None:
     Args:
         results: Dict from load_experiment_results()
         output_dir: Directory to save tables
+
+    Raises:
+        ValueError: If results is empty or missing required keys
+        OSError: If output directory is not writable or file write fails
     """
+    # Validate results dict is non-empty
+    if not results:
+        raise ValueError(
+            "Cannot generate summary table: results dict is empty. "
+            "Ensure experiment CSVs were loaded successfully."
+        )
+
+    # Required keys that must be present in each experiment's metrics
+    required_keys = [
+        "total_pnl",
+        "total_trades",
+        "avg_cost_per_trade",
+        "final_epsilon",
+        "steps_until_eps_05",
+    ]
+
     rows = []
     for exp_name, metrics in results.items():
+        # Validate metrics dict contains all required keys
+        missing_keys = [key for key in required_keys if key not in metrics]
+        if missing_keys:
+            raise ValueError(
+                f"Experiment '{exp_name}' missing required metrics: {missing_keys}. "
+                f"Expected keys: {required_keys}"
+            )
+
         # Parse experiment name: exp_<strategy>_<held|no_held>
         parts = exp_name.replace("exp_", "").split("_")
 
@@ -181,25 +209,45 @@ def generate_summary_table(results: dict, output_dir: Path) -> None:
         reverse=True
     )
 
-    # Write markdown
+    # Write markdown with error handling
     md_path = output_dir / "summary_table.md"
-    with open(md_path, "w") as f:
-        # Header
-        f.write("# Exploration Strategy Comparison\n\n")
-        f.write("| Strategy | Held? | Total PnL | Trades | Avg Cost | Final ε | Steps to 0.05 |\n")
-        f.write("|----------|-------|-----------|--------|----------|---------|---------------|\n")
+    try:
+        with open(md_path, "w") as f:
+            # Header
+            f.write("# Exploration Strategy Comparison\n\n")
+            f.write("| Strategy | Held? | Total PnL | Trades | Avg Cost | Final ε | Steps to 0.05 |\n")
+            f.write("|----------|-------|-----------|--------|----------|---------|---------------|\n")
 
-        # Rows
-        for row in rows:
-            f.write(
-                f"| {row['Strategy']} | {row['Held?']} | {row['Total PnL']} | "
-                f"{row['Trades']} | {row['Avg Cost']} | {row['Final ε']} | "
-                f"{row['Steps to 0.05']} |\n"
-            )
+            # Rows
+            for row in rows:
+                f.write(
+                    f"| {row['Strategy']} | {row['Held?']} | {row['Total PnL']} | "
+                    f"{row['Trades']} | {row['Avg Cost']} | {row['Final ε']} | "
+                    f"{row['Steps to 0.05']} |\n"
+                )
+    except PermissionError as e:
+        raise OSError(
+            f"Permission denied writing to {md_path}. "
+            f"Check directory permissions for {output_dir}"
+        ) from e
+    except OSError as e:
+        raise OSError(
+            f"Failed to write markdown summary to {md_path}: {e}"
+        ) from e
 
-    # Write CSV
+    # Write CSV with error handling
     csv_path = output_dir / "summary_table.csv"
-    pl.DataFrame(rows).write_csv(csv_path)
+    try:
+        pl.DataFrame(rows).write_csv(csv_path)
+    except PermissionError as e:
+        raise OSError(
+            f"Permission denied writing to {csv_path}. "
+            f"Check directory permissions for {output_dir}"
+        ) from e
+    except OSError as e:
+        raise OSError(
+            f"Failed to write CSV summary to {csv_path}: {e}"
+        ) from e
 
     print(f"Summary table saved: {md_path}")
     print(f"Summary CSV saved: {csv_path}")
