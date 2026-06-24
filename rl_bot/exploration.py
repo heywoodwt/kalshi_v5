@@ -182,3 +182,72 @@ class LogarithmicDecay(ExplorationStrategy):
         masked_q = np.copy(q_values)
         masked_q[valid_mask == 0] = -np.inf
         return int(np.argmax(masked_q))
+
+
+class EpisodeBased(ExplorationStrategy):
+    """Episode-based exponential decay: eps decays per episode, not per step.
+
+    The replay loop must set strategy.episode_count before each episode.
+    Epsilon depends only on episode_count, not step parameter.
+    Action selection: standard epsilon-greedy.
+    """
+
+    def __init__(self, config: dict):
+        """Initialize with episode_count tracker.
+
+        Args:
+            config: Dict containing eps_start, eps_end, decay_rate
+        """
+        super().__init__(config)
+        # Set externally by replay.py before each episode
+        self.episode_count = 0
+
+    def epsilon(self, step: int) -> float:
+        """Exponential decay by episode count (step param ignored).
+
+        Formula: eps = max(eps_end, eps_start * decay_rate^episode_count)
+
+        Args:
+            step: Training step (ignored for episode-based decay)
+
+        Returns:
+            Epsilon value in [eps_end, eps_start]
+        """
+        eps_start = self.config["eps_start"]
+        eps_end = self.config["eps_end"]
+        decay_rate = self.config["decay_rate"]
+
+        # Exponential decay by episode: eps_start * decay_rate^episode_count
+        eps = eps_start * (decay_rate ** self.episode_count)
+        # Floor at eps_end to prevent epsilon from becoming arbitrarily small
+        return max(eps_end, eps)
+
+    def select_action(
+        self,
+        step: int,
+        q_values: np.ndarray,
+        valid_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Standard epsilon-greedy action selection.
+
+        Args:
+            step: Training step (unused for episode-based decay)
+            q_values: Raw Q-values from network, shape (n_actions,)
+            valid_mask: Binary mask, 1=valid, 0=invalid, shape (n_actions,)
+            rng: Numpy random generator for deterministic sampling
+
+        Returns:
+            Integer action ID
+        """
+        eps = self.epsilon(step)
+
+        # Explore: random valid action with probability epsilon
+        if rng.random() < eps:
+            valid_actions = np.where(valid_mask > 0)[0]
+            return int(rng.choice(valid_actions))
+
+        # Greedy: argmax of valid Q-values (invalid actions set to -inf)
+        masked_q = np.copy(q_values)
+        masked_q[valid_mask == 0] = -np.inf
+        return int(np.argmax(masked_q))
