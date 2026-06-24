@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from rl_bot.exploration import ExplorationStrategy, FastLinearDecay
+from rl_bot.exploration import ExplorationStrategy, FastLinearDecay, ExponentialDecay
 
 
 def test_base_class_cannot_be_instantiated():
@@ -46,3 +46,35 @@ def test_fast_linear_decay_action_selection():
     actions = [strategy.select_action(100, q_values, valid_mask, rng) for _ in range(20)]
     # Most should be greedy (action 0)
     assert actions.count(0) >= 15
+
+
+def test_exponential_decay_epsilon():
+    """Verify exponential decay formula and floor."""
+    strategy = ExponentialDecay({
+        "eps_start": 0.8,
+        "eps_end": 0.05,
+        "decay_rate": 0.99,
+    })
+
+    assert strategy.epsilon(0) == 0.8
+    # After 100 steps: 0.8 * 0.99^100 ≈ 0.2907
+    assert strategy.epsilon(100) == pytest.approx(max(0.05, 0.8 * 0.99**100), abs=1e-4)
+    # After 1000 steps: hits floor
+    assert strategy.epsilon(1000) == 0.05
+
+
+def test_exponential_decay_action_selection():
+    """Verify action selection is epsilon-greedy."""
+    strategy = ExponentialDecay({
+        "eps_start": 1.0,
+        "eps_end": 0.05,
+        "decay_rate": 0.99,
+    })
+
+    rng = np.random.default_rng(123)
+    q_values = np.array([5.0, 1.0, 2.0])
+    valid_mask = np.ones(3)
+
+    # High epsilon: mostly random
+    actions = [strategy.select_action(0, q_values, valid_mask, rng) for _ in range(50)]
+    assert len(set(actions)) >= 2  # some exploration

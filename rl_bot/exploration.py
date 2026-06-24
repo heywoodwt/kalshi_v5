@@ -96,3 +96,42 @@ class FastLinearDecay(ExplorationStrategy):
         masked_q = np.copy(q_values)
         masked_q[valid_mask == 0] = -np.inf
         return int(np.argmax(masked_q))
+
+
+class ExponentialDecay(ExplorationStrategy):
+    """Exponential epsilon decay: eps = max(eps_end, eps_start * decay_rate^step).
+
+    Aggressive early reduction, asymptotic approach to floor.
+    Action selection: standard epsilon-greedy.
+    """
+
+    def epsilon(self, step: int) -> float:
+        """Exponential decay with floor."""
+        eps_start = self.config["eps_start"]
+        eps_end = self.config["eps_end"]
+        decay_rate = self.config["decay_rate"]
+
+        # Compute exponential decay: eps_start * decay_rate^step
+        eps = eps_start * (decay_rate ** step)
+        # Floor at eps_end to prevent epsilon from becoming arbitrarily small
+        return max(eps_end, eps)
+
+    def select_action(
+        self,
+        step: int,
+        q_values: np.ndarray,
+        valid_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Epsilon-greedy: explore with probability epsilon."""
+        eps = self.epsilon(step)
+
+        # Explore: random valid action with probability epsilon
+        if rng.random() < eps:
+            valid_actions = np.where(valid_mask > 0)[0]
+            return int(rng.choice(valid_actions))
+
+        # Greedy: argmax of valid Q-values (invalid actions set to -inf)
+        masked_q = np.copy(q_values)
+        masked_q[valid_mask == 0] = -np.inf
+        return int(np.argmax(masked_q))
