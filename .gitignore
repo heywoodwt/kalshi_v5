@@ -7,3 +7,7 @@ model/tft/checkpoints/
 lightning_logs/
 csv_logs/
 __pycache__/
+
+# Generated SLURM experiment scripts
+hpc/exp_*.slurm
+hpc/exploration_exps/
