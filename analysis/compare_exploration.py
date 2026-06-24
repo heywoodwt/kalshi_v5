@@ -13,6 +13,15 @@ import argparse
 from pathlib import Path
 import polars as pl
 
+# Threshold for filtering near-zero rewards to identify actual trades.
+# Rewards below this magnitude are treated as no-op/holding actions.
+TRADE_REWARD_THRESHOLD = 1e-9
+
+# Epsilon exploration floor value with small tolerance.
+# Target epsilon floor is 0.05, but we use 0.051 to account for floating-point
+# precision and ensure we capture all rows that have reached the floor.
+EPSILON_FLOOR_THRESHOLD = 0.051
+
 
 def load_experiment_results(csv_dir: Path) -> dict[str, dict]:
     """Load all experiment CSVs and compute summary metrics.
@@ -51,50 +60,78 @@ def load_experiment_results(csv_dir: Path) -> dict[str, dict]:
         # e.g., "rl_trades_exp_fast_linear_held.csv" -> "exp_fast_linear_held"
         exp_name = csv_path.stem.replace("rl_trades_", "")
 
-        # Load CSV
-        df = pl.read_csv(csv_path)
+        try:
+            # Load CSV with error handling
+            df = pl.read_csv(csv_path)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"CSV file not found: {csv_path}"
+            ) from e
+        except Exception as e:
+            raise ValueError(
+                f"Failed to read CSV {csv_path}: {e}"
+            ) from e
 
-        # Compute metrics
-        total_pnl = float(df["cumulative_pnl"].tail(1).item())
+        # Verify required columns exist
+        required_cols = ["cumulative_pnl", "reward", "epsilon", "step"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(
+                f"CSV {csv_path} missing required columns: {missing_cols}"
+            )
 
-        # Trades = rows where reward changed (abs(reward) > threshold)
-        total_trades = df.filter(pl.col("reward").abs() > 1e-9).height
+        try:
+            # Compute metrics
+            total_pnl = float(df["cumulative_pnl"].tail(1).item())
 
-        avg_cost = total_pnl / total_trades if total_trades > 0 else 0.0
-        final_eps = float(df["epsilon"].tail(1).item())
+            # Trades = rows where reward changed (abs(reward) > threshold)
+            total_trades = df.filter(
+                pl.col("reward").abs() > TRADE_REWARD_THRESHOLD
+            ).height
 
-        # Steps to reach epsilon floor (0.05)
-        eps_05_rows = df.filter(pl.col("epsilon") <= 0.051)
-        steps_until_eps_05 = (
-            int(eps_05_rows["step"].min())
-            if eps_05_rows.height > 0
-            else int(df["step"].max())
-        )
+            avg_cost = total_pnl / total_trades if total_trades > 0 else 0.0
+            final_eps = float(df["epsilon"].tail(1).item())
 
-        # Timelines for plotting
-        trade_timeline = (
-            df.filter(pl.col("reward").abs() > 1e-9)["step"].to_list()
-        )
+            # Steps to reach epsilon floor with tolerance
+            eps_floor_rows = df.filter(
+                pl.col("epsilon") <= EPSILON_FLOOR_THRESHOLD
+            )
+            steps_until_eps_05 = (
+                int(eps_floor_rows["step"].min())
+                if eps_floor_rows.height > 0
+                else int(df["step"].max())
+            )
 
-        pnl_curve = list(
-            zip(df["step"].to_list(), df["cumulative_pnl"].to_list())
-        )
+            # Timelines for plotting
+            trade_timeline = (
+                df.filter(pl.col("reward").abs() > TRADE_REWARD_THRESHOLD)[
+                    "step"
+                ].to_list()
+            )
 
-        epsilon_curve = list(
-            zip(df["step"].to_list(), df["epsilon"].to_list())
-        )
+            pnl_curve = list(
+                zip(df["step"].to_list(), df["cumulative_pnl"].to_list())
+            )
 
-        results[exp_name] = {
-            "df": df,
-            "total_pnl": total_pnl,
-            "total_trades": total_trades,
-            "avg_cost_per_trade": avg_cost,
-            "final_epsilon": final_eps,
-            "steps_until_eps_05": steps_until_eps_05,
-            "trade_timeline": trade_timeline,
-            "pnl_curve": pnl_curve,
-            "epsilon_curve": epsilon_curve,
-        }
+            epsilon_curve = list(
+                zip(df["step"].to_list(), df["epsilon"].to_list())
+            )
+
+            results[exp_name] = {
+                "df": df,
+                "total_pnl": total_pnl,
+                "total_trades": total_trades,
+                "avg_cost_per_trade": avg_cost,
+                "final_epsilon": final_eps,
+                "steps_until_eps_05": steps_until_eps_05,
+                "trade_timeline": trade_timeline,
+                "pnl_curve": pnl_curve,
+                "epsilon_curve": epsilon_curve,
+            }
+        except (KeyError, ValueError, TypeError) as e:
+            raise ValueError(
+                f"Failed to compute metrics for {csv_path}: {e}"
+            ) from e
 
     return results
 
