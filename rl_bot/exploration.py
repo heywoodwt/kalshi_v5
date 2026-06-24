@@ -55,3 +55,44 @@ class ExplorationStrategy(ABC):
             Integer action ID [0, 20]
         """
         pass
+
+
+class FastLinearDecay(ExplorationStrategy):
+    """Linear epsilon decay from eps_start to eps_end over decay_steps.
+
+    Action selection: standard epsilon-greedy (random valid action vs. greedy).
+    """
+
+    def epsilon(self, step: int) -> float:
+        """Linear interpolation from start to end."""
+        eps_start = self.config["eps_start"]
+        eps_end = self.config["eps_end"]
+        decay_steps = self.config["decay_steps"]
+
+        # After decay_steps, stay at floor
+        if step >= decay_steps:
+            return eps_end
+
+        # Linear interpolation: eps_start -> eps_end over decay_steps
+        frac = step / decay_steps
+        return eps_start + (eps_end - eps_start) * frac
+
+    def select_action(
+        self,
+        step: int,
+        q_values: np.ndarray,
+        valid_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Epsilon-greedy: explore with probability epsilon."""
+        eps = self.epsilon(step)
+
+        # Explore: random valid action
+        if rng.random() < eps:
+            valid_actions = np.where(valid_mask > 0)[0]
+            return int(rng.choice(valid_actions))
+
+        # Greedy: argmax of valid Q-values (invalid actions set to -inf)
+        masked_q = np.copy(q_values)
+        masked_q[valid_mask == 0] = -np.inf
+        return int(np.argmax(masked_q))
