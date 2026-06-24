@@ -5,6 +5,7 @@ and alternative exploration approaches. Each strategy controls both the
 exploration rate (epsilon) and the action selection logic.
 """
 from abc import ABC, abstractmethod
+import math
 import numpy as np
 
 
@@ -124,6 +125,52 @@ class ExponentialDecay(ExplorationStrategy):
         rng: np.random.Generator,
     ) -> int:
         """Epsilon-greedy: explore with probability epsilon."""
+        eps = self.epsilon(step)
+
+        # Explore: random valid action with probability epsilon
+        if rng.random() < eps:
+            valid_actions = np.where(valid_mask > 0)[0]
+            return int(rng.choice(valid_actions))
+
+        # Greedy: argmax of valid Q-values (invalid actions set to -inf)
+        masked_q = np.copy(q_values)
+        masked_q[valid_mask == 0] = -np.inf
+        return int(np.argmax(masked_q))
+
+
+class LogarithmicDecay(ExplorationStrategy):
+    """Logarithmic epsilon decay: fast early, asymptotic slowdown.
+
+    Formula: eps = eps_end + (eps_start - eps_end) * (1 - log(step+1)/log(decay_steps+1))
+
+    Provides middle ground between linear and exponential.
+    Action selection: standard epsilon-greedy.
+    """
+
+    def epsilon(self, step: int) -> float:
+        """Logarithmic decay with floor."""
+        eps_start = self.config["eps_start"]
+        eps_end = self.config["eps_end"]
+        decay_steps = self.config["decay_steps"]
+
+        # After decay_steps, stay at floor
+        if step >= decay_steps:
+            return eps_end
+
+        # Log progress: 0 at step 0, 1 at decay_steps
+        # Using log(step+1) to handle step=0 naturally
+        progress = math.log(step + 1) / math.log(decay_steps + 1)
+        eps = eps_end + (eps_start - eps_end) * (1.0 - progress)
+        return eps
+
+    def select_action(
+        self,
+        step: int,
+        q_values: np.ndarray,
+        valid_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Standard epsilon-greedy."""
         eps = self.epsilon(step)
 
         # Explore: random valid action with probability epsilon

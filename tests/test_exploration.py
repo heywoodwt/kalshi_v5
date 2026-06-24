@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from rl_bot.exploration import ExplorationStrategy, FastLinearDecay, ExponentialDecay
+from rl_bot.exploration import ExplorationStrategy, FastLinearDecay, ExponentialDecay, LogarithmicDecay
 
 
 def test_base_class_cannot_be_instantiated():
@@ -78,3 +78,41 @@ def test_exponential_decay_action_selection():
     # High epsilon: mostly random
     actions = [strategy.select_action(0, q_values, valid_mask, rng) for _ in range(50)]
     assert len(set(actions)) >= 2  # some exploration
+
+
+def test_logarithmic_decay_epsilon():
+    """Verify logarithmic decay shape (fast early, slow late)."""
+    strategy = LogarithmicDecay({
+        "eps_start": 0.8,
+        "eps_end": 0.05,
+        "decay_steps": 1000,
+    })
+
+    eps_0 = strategy.epsilon(0)
+    eps_100 = strategy.epsilon(100)
+    eps_500 = strategy.epsilon(500)
+    eps_1000 = strategy.epsilon(1000)
+
+    # Monotonic decreasing
+    assert eps_0 > eps_100 > eps_500 > eps_1000
+    # Floor at decay_steps
+    assert eps_1000 == 0.05
+    # Start value
+    assert eps_0 == 0.8
+
+
+def test_logarithmic_decay_action_selection():
+    """Verify epsilon-greedy behavior."""
+    strategy = LogarithmicDecay({
+        "eps_start": 1.0,
+        "eps_end": 0.05,
+        "decay_steps": 100,
+    })
+
+    rng = np.random.default_rng(99)
+    q_values = np.array([10.0, 1.0])
+    valid_mask = np.ones(2)
+
+    # At floor (step 100), mostly greedy
+    actions = [strategy.select_action(100, q_values, valid_mask, rng) for _ in range(30)]
+    assert actions.count(0) >= 25  # mostly action 0 (greedy)
