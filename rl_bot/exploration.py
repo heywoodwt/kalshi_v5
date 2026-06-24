@@ -333,3 +333,71 @@ class ActionLocal(ExplorationStrategy):
             # Control action (18-20): fallback to random valid action
             valid_actions = np.where(valid_mask > 0)[0]
             return int(rng.choice(valid_actions))
+
+
+class ParameterNoise(ExplorationStrategy):
+    """Parameter noise exploration: perturb Q-values with Gaussian noise.
+
+    Instead of epsilon-greedy, adds noise directly to Q-values before argmax.
+    Noise std decays linearly from noise_std_start to noise_std_end.
+
+    This is a simplified version - full implementation would perturb network
+    weights, but Q-value perturbation achieves similar effect with O(1) cost.
+    """
+
+    def epsilon(self, step: int) -> float:
+        """No epsilon (always greedy on noisy Q-values)."""
+        return 0.0
+
+    def _noise_std(self, step: int) -> float:
+        """Compute noise standard deviation at given step.
+
+        Linear interpolation from noise_std_start to noise_std_end.
+        After decay_steps, stays at noise_std_end.
+
+        Args:
+            step: Current training step
+
+        Returns:
+            Noise standard deviation
+        """
+        noise_std_start = self.config["noise_std_start"]
+        noise_std_end = self.config["noise_std_end"]
+        decay_steps = self.config["decay_steps"]
+
+        # After decay_steps, stay at floor
+        if step >= decay_steps:
+            return noise_std_end
+
+        # Linear interpolation: noise_std_start -> noise_std_end over decay_steps
+        frac = step / decay_steps
+        return noise_std_start + (noise_std_end - noise_std_start) * frac
+
+    def select_action(
+        self,
+        step: int,
+        q_values: np.ndarray,
+        valid_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Greedy on noisy Q-values (add Gaussian noise).
+
+        Args:
+            step: Current training step
+            q_values: Raw Q-values from network, shape (n_actions,)
+            valid_mask: Binary mask, 1=valid, 0=invalid, shape (n_actions,)
+            rng: Numpy random generator for deterministic sampling
+
+        Returns:
+            Integer action ID with maximum noisy Q-value among valid actions
+        """
+        noise_std = self._noise_std(step)
+
+        # Add Gaussian noise to Q-values
+        noise = rng.normal(0, noise_std, size=q_values.shape)
+        noisy_q = q_values + noise
+
+        # Greedy on noisy Q-values (respect action mask)
+        masked_q = np.copy(noisy_q)
+        masked_q[valid_mask == 0] = -np.inf
+        return int(np.argmax(masked_q))

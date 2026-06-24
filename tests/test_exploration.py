@@ -206,3 +206,58 @@ def test_action_local_greedy_at_low_epsilon():
     actions = [strategy.select_action(100, q_values, valid_mask, rng) for _ in range(40)]
     # Most should be greedy (action 5)
     assert actions.count(5) >= 35
+
+
+def test_parameter_noise_epsilon_is_zero():
+    """ParameterNoise has no epsilon (always greedy on noisy Q-values)."""
+    from rl_bot.exploration import ParameterNoise
+
+    strategy = ParameterNoise({
+        "noise_std_start": 0.1,
+        "noise_std_end": 0.01,
+        "decay_steps": 100,
+    })
+
+    # Epsilon is always 0 (no epsilon-greedy, just noisy network)
+    assert strategy.epsilon(0) == 0.0
+    assert strategy.epsilon(50) == 0.0
+    assert strategy.epsilon(100) == 0.0
+
+
+def test_parameter_noise_adds_noise_to_q_values():
+    """Verify noise is added to Q-values during action selection."""
+    from rl_bot.exploration import ParameterNoise
+
+    strategy = ParameterNoise({
+        "noise_std_start": 0.5,  # high noise for testing
+        "noise_std_end": 0.01,
+        "decay_steps": 100,
+    })
+
+    rng = np.random.default_rng(888)
+    q_values = np.array([5.0, 4.9, 1.0])  # greedy=0, but 1 is close
+    valid_mask = np.ones(3)
+
+    # With high noise, greedy action should vary
+    actions = [strategy.select_action(0, q_values, valid_mask, rng) for _ in range(50)]
+    # Not all action 0 (noise causes variance)
+    assert len(set(actions)) > 1
+
+
+def test_parameter_noise_decay():
+    """Verify noise std decays linearly."""
+    from rl_bot.exploration import ParameterNoise
+
+    strategy = ParameterNoise({
+        "noise_std_start": 0.1,
+        "noise_std_end": 0.01,
+        "decay_steps": 100,
+    })
+
+    # At step 0
+    assert strategy._noise_std(0) == 0.1
+    # At step 50
+    assert strategy._noise_std(50) == pytest.approx(0.055)
+    # At step 100+
+    assert strategy._noise_std(100) == 0.01
+    assert strategy._noise_std(200) == 0.01
