@@ -156,3 +156,53 @@ def test_episode_based_action_selection():
     # Should explore
     actions = [strategy.select_action(0, q_values, valid_mask, rng) for _ in range(30)]
     assert len(set(actions)) >= 2
+
+
+def test_action_local_explores_same_direction():
+    """Verify action-local explores within same direction for buy actions."""
+    from rl_bot.exploration import ActionLocal
+
+    strategy = ActionLocal({
+        "eps_start": 1.0,
+        "eps_end": 0.05,
+        "decay_steps": 100,
+    })
+
+    rng = np.random.default_rng(42)
+
+    # Mock Q-values where greedy action is BUY_YES_1_AT_0c (action 0)
+    # Action space: 0-8=YES, 9-17=NO, 18=HOLD, 19=CLOSE_YES, 20=CLOSE_NO
+    q_values = np.zeros(21)
+    q_values[0] = 10.0  # highest Q
+    valid_mask = np.ones(21)
+
+    # With eps=1.0 (step 0), should explore within YES direction (0-8) or HOLD
+    actions = [strategy.select_action(0, q_values, valid_mask, rng) for _ in range(100)]
+
+    # No NO trades (9-17) when greedy action is YES
+    assert all(a not in range(9, 18) for a in actions)
+
+    # Should explore different YES actions (not all action 0)
+    yes_actions = [a for a in actions if 0 <= a <= 8]
+    assert len(set(yes_actions)) > 1
+
+
+def test_action_local_greedy_at_low_epsilon():
+    """At low epsilon, should be mostly greedy."""
+    from rl_bot.exploration import ActionLocal
+
+    strategy = ActionLocal({
+        "eps_start": 1.0,
+        "eps_end": 0.05,
+        "decay_steps": 100,
+    })
+
+    rng = np.random.default_rng(555)
+    q_values = np.zeros(21)
+    q_values[5] = 20.0  # greedy action
+    valid_mask = np.ones(21)
+
+    # At step 100, eps=0.05
+    actions = [strategy.select_action(100, q_values, valid_mask, rng) for _ in range(40)]
+    # Most should be greedy (action 5)
+    assert actions.count(5) >= 35

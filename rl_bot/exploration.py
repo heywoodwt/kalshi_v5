@@ -251,3 +251,85 @@ class EpisodeBased(ExplorationStrategy):
         masked_q = np.copy(q_values)
         masked_q[valid_mask == 0] = -np.inf
         return int(np.argmax(masked_q))
+
+
+class ActionLocal(ExplorationStrategy):
+    """Action-local exploration: explore near greedy action instead of random.
+
+    Epsilon decay: linear (same as FastLinearDecay).
+    Action selection: explores within same direction/category as greedy action.
+
+    For buy actions (0-17): vary size/offset within same direction (YES/NO).
+    For control actions (18-20): fallback to random valid action.
+
+    Action encoding: direction_idx * 9 + size_idx * 3 + offset_idx
+    - direction_idx: 0=YES, 1=NO (9 actions per direction)
+    - size_idx: 0-2 (3 sizes: [1, 3, 5])
+    - offset_idx: 0-2 (3 offsets: [0.0, 0.02, 0.04])
+    """
+
+    def epsilon(self, step: int) -> float:
+        """Linear decay (same as FastLinearDecay)."""
+        eps_start = self.config["eps_start"]
+        eps_end = self.config["eps_end"]
+        decay_steps = self.config["decay_steps"]
+
+        # After decay_steps, stay at floor
+        if step >= decay_steps:
+            return eps_end
+
+        # Linear interpolation: eps_start -> eps_end over decay_steps
+        frac = step / decay_steps
+        return eps_start + (eps_end - eps_start) * frac
+
+    def select_action(
+        self,
+        step: int,
+        q_values: np.ndarray,
+        valid_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Explore near greedy action instead of uniformly random.
+
+        For buy actions (0-17): explore within same direction as greedy.
+        For control actions (18-20): fallback to random valid action.
+
+        Args:
+            step: Current training step
+            q_values: Raw Q-values from network, shape (n_actions,)
+            valid_mask: Binary mask, 1=valid, 0=invalid, shape (n_actions,)
+            rng: Numpy random generator for deterministic sampling
+
+        Returns:
+            Integer action ID [0, 20]
+        """
+        # Compute greedy action first (mask invalid actions)
+        masked_q = np.copy(q_values)
+        masked_q[valid_mask == 0] = -np.inf
+        greedy = int(np.argmax(masked_q))
+
+        eps = self.epsilon(step)
+
+        # Exploit: return greedy with probability (1 - epsilon)
+        if rng.random() >= eps:
+            return greedy
+
+        # Explore: near greedy action
+        if greedy < 18:
+            # Buy action (0-17): explore within same direction
+            # Extract direction from greedy action: direction_idx = greedy // 9
+            direction_idx = greedy // 9  # 0=YES, 1=NO
+
+            # Randomly pick size_idx and offset_idx
+            size_idx = rng.choice([0, 1, 2])
+            offset_idx = rng.choice([0, 1, 2])
+
+            # Reconstruct action: direction_idx * 9 + size_idx * 3 + offset_idx
+            action = direction_idx * 9 + size_idx * 3 + offset_idx
+
+            # Return action if valid, else fallback to greedy
+            return action if valid_mask[action] > 0 else greedy
+        else:
+            # Control action (18-20): fallback to random valid action
+            valid_actions = np.where(valid_mask > 0)[0]
+            return int(rng.choice(valid_actions))
