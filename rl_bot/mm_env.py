@@ -146,6 +146,16 @@ class MMEnv(gymnasium.Env):
         self._inventory_flat_step = 0  # Last step when inventory was 0
         self._mid_history: list[float] = []  # For price momentum (last 5 steps)
 
+        # Per-step state for logging
+        self._current_ticker = ""
+        self._fills_buy = 0  # Contracts bought this step
+        self._fills_sell = 0  # Contracts sold this step
+        self._current_bid = 0.0
+        self._current_ask = 0.0
+        self._current_half_spread = 0.0
+        self._current_skew = 0.0
+        self._current_timestamp = ""
+
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -160,6 +170,7 @@ class MMEnv(gymnasium.Env):
         self._ticker_idx = (self._ticker_idx + 1) % len(self._tickers)
         ticker = self._tickers[self._ticker_idx]
         self._windows = self._ticker_data[ticker]
+        self._current_ticker = ticker
 
         # Reset episode state
         self._step_idx = 0
@@ -169,6 +180,15 @@ class MMEnv(gymnasium.Env):
         self._prev_value = 0.0
         self._inventory_flat_step = 0
         self._mid_history = []
+
+        # Reset per-step state
+        self._fills_buy = 0
+        self._fills_sell = 0
+        self._current_bid = 0.0
+        self._current_ask = 0.0
+        self._current_half_spread = 0.0
+        self._current_skew = 0.0
+        self._current_timestamp = ""
 
         # Compute initial mid price from first window
         if self._windows and self._windows[0]:
@@ -193,8 +213,14 @@ class MMEnv(gymnasium.Env):
         Returns:
             tuple of (obs, reward, terminated, truncated, info)
         """
+        # Reset per-step counters
+        self._fills_buy = 0
+        self._fills_sell = 0
+
         # Scale action to actual quote parameters
         half_spread, skew = scale_action(action, self._cfg)
+        self._current_half_spread = half_spread
+        self._current_skew = skew
 
         # Current window's trades
         current_window = self._windows[self._step_idx]
@@ -202,6 +228,8 @@ class MMEnv(gymnasium.Env):
         # Compute mid price for this window (VWAP if trades exist, else previous mid)
         if current_window:
             self._mid = self._compute_vwap(current_window)
+            # Store timestamp from first trade in window
+            self._current_timestamp = str(current_window[0]["created_time"])
         # else: keep previous mid
 
         # Compute bid/ask from mid + action
@@ -211,6 +239,9 @@ class MMEnv(gymnasium.Env):
         # Clamp to valid Kalshi range [0.01, 0.99]
         bid = max(0.01, min(0.99, bid))
         ask = max(0.01, min(0.99, ask))
+
+        self._current_bid = bid
+        self._current_ask = ask
 
         # Simulate fills for all trades in this window
         for trade in current_window:
@@ -259,9 +290,19 @@ class MMEnv(gymnasium.Env):
 
         obs = self._build_obs()
         info = {
+            "ticker": self._current_ticker,
+            "timestamp": self._current_timestamp,
+            "bid": self._current_bid,
+            "ask": self._current_ask,
+            "inventory": self._inventory,
+            "fills_buy": self._fills_buy,
+            "fills_sell": self._fills_sell,
+            "pnl": self._realized_pnl + self._unrealized_pnl(),
+            "reward": reward,
+            "half_spread": self._current_half_spread,
+            "skew": self._current_skew,
             "realized_pnl": self._realized_pnl,
             "unrealized_pnl": self._unrealized_pnl(),
-            "inventory": self._inventory,
             "mid_price": self._mid,
         }
 
@@ -308,6 +349,9 @@ class MMEnv(gymnasium.Env):
         if size <= 0:
             return
 
+        # Track fills for this step
+        self._fills_buy += size
+
         # Deduct maker fee
         fee = compute_maker_fee(size, price, self._cfg.maker_fee_rate)
         self._realized_pnl -= fee
@@ -343,6 +387,9 @@ class MMEnv(gymnasium.Env):
 
         if size <= 0:
             return
+
+        # Track fills for this step
+        self._fills_sell += size
 
         # Deduct maker fee
         fee = compute_maker_fee(size, price, self._cfg.maker_fee_rate)
