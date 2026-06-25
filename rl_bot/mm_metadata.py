@@ -4,12 +4,9 @@ Supports dual-mode operation:
 - Parquet mode (training): Load from markets.parquet file
 - API mode (production): Fetch from Kalshi REST API with caching
 """
-from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import polars as pl
 
@@ -33,23 +30,17 @@ class MarketMetadataLoader:
         self,
         mode: str = "parquet",  # "parquet" or "api"
         parquet_path: str | None = None,
-        api_base_url: str | None = None,
-        cache_ttl_s: int = 3600,
     ):
-        """Initialize loader in parquet or API mode.
+        """Initialize loader in parquet mode.
 
         Args:
-            mode: "parquet" (training) or "api" (production)
+            mode: "parquet" (training)
             parquet_path: Path to markets.parquet file (parquet mode)
-            api_base_url: Kalshi API base URL (API mode)
-            cache_ttl_s: Cache TTL in seconds (API mode only)
         """
         self._mode = mode
         self._parquet_path = parquet_path
-        self._api_base_url = api_base_url
-        self._cache_ttl_s = cache_ttl_s
+        # Cache for storing loaded metadata for get_valid_tick_size lookups
         self._cache: dict[str, MarketMetadata] = {}
-        self._cache_time: float = 0.0
 
     def load_metadata(self, tickers: list[str]) -> dict[str, MarketMetadata]:
         """Load metadata for given tickers.
@@ -84,7 +75,7 @@ class MarketMetadataLoader:
         df = pl.read_parquet(self._parquet_path)
 
         # Filter to requested tickers if provided
-        if tickers:
+        if tickers is not None and tickers:
             df = df.filter(pl.col("ticker").is_in(tickers))
 
         # Build metadata dict
