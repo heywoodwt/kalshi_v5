@@ -59,6 +59,29 @@ def preprocess_mm_data(
     return result
 
 
+def scale_action(action: np.ndarray, cfg: MMConfig) -> tuple[float, float]:
+    """Convert action array to half_spread and skew values.
+
+    Args:
+        action: np.array([half_spread_control, skew_control]) in range [-1, 1]
+        cfg: MMConfig with spread bounds
+
+    Returns:
+        (half_spread, skew) tuple
+        - half_spread: in range [0.01, 0.10] (minimum 1 cent, maximum 10 cents)
+        - skew: in range [-0.05, 0.05] (skew prices by up to 5 cents)
+    """
+    # Map half_spread_control from [-1, 1] to [0.01, 0.10]
+    half_spread_control = np.clip(action[0], -1.0, 1.0)
+    half_spread = 0.01 + (half_spread_control + 1.0) / 2.0 * 0.09  # [0.01, 0.10]
+
+    # Map skew_control from [-1, 1] to [-0.05, 0.05]
+    skew_control = np.clip(action[1], -1.0, 1.0)
+    skew = skew_control * 0.05  # [-0.05, 0.05]
+
+    return round(half_spread, 3), round(skew, 3)
+
+
 class MMEnv(gymnasium.Env):
     """Market-making environment with multi-ticker support."""
 
@@ -138,6 +161,20 @@ class MMEnv(gymnasium.Env):
         self._fills_sell = 0
         self._realized_pnl = 0.0
         self._tte_hours = 1.0
+        self._current_bid = 0.0
+        self._current_ask = 0.0
+        self._current_half_spread = 0.0
+        self._current_skew = 0.0
+        self._current_timestamp = None
+
+        # Action space: [half_spread_control, skew_control]
+        # Both in range [-1, 1]
+        self.action_space = gymnasium.spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            shape=(2,),
+            dtype=np.float32,
+        )
 
     def _build_obs(self) -> np.ndarray:
         """Build 16-dimensional observation vector.
@@ -241,6 +278,11 @@ class MMEnv(gymnasium.Env):
         self._fills_sell = 0
         self._realized_pnl = 0.0
         self._tte_hours = 1.0
+        self._current_bid = 0.0
+        self._current_ask = 0.0
+        self._current_half_spread = 0.0
+        self._current_skew = 0.0
+        self._current_timestamp = None
 
         # Build initial observation
         obs = self._build_obs()
@@ -249,6 +291,130 @@ class MMEnv(gymnasium.Env):
             "step": 0,
         }
         return obs, info
+
+    def step(self, action: np.ndarray):
+        """Execute one step of the environment with market-making action.
+
+        Args:
+            action: np.array([half_spread_control, skew_control]) in range [-1, 1]
+
+        Returns:
+            observation: 16-dim state vector
+            reward: realized PnL change from fills
+            terminated: True if episode is done (ran out of data)
+            truncated: False (not used for now)
+            info: dict with diagnostic information
+        """
+        # Check if episode is done (no more windows)
+        if self._step_idx >= len(self._windows):
+            terminated = True
+            obs = self._build_obs()
+            info = {
+                "ticker": self._current_ticker,
+                "timestamp": self._current_timestamp,
+                "bid": self._current_bid,
+                "ask": self._current_ask,
+                "inventory": self._inventory,
+                "fills_buy": self._fills_buy,
+                "fills_sell": self._fills_sell,
+                "pnl": self._realized_pnl + self._unrealized_pnl(),
+                "reward": 0.0,
+                "half_spread": self._current_half_spread,
+                "skew": self._current_skew,
+                "realized_pnl": self._realized_pnl,
+                "unrealized_pnl": self._unrealized_pnl(),
+                "mid_price": self._mid,
+            }
+            return obs, 0.0, terminated, False, info
+
+        # Get current window
+        window = self._windows[self._step_idx]
+        self._current_timestamp = window.get("timestamp")
+
+        # Update mid price from orderbook or VWAP
+        orderbook = window.get("orderbook")
+        if orderbook is not None and orderbook.mid_price() is not None:
+            # Use orderbook mid (task 3)
+            self._mid = orderbook.mid_price()
+        else:
+            # Fallback to VWAP from trades
+            trades = window.get("trades", [])
+            if trades:
+                total_price = sum(t["yes_price"] * t["count"] for t in trades)
+                total_count = sum(t["count"] for t in trades)
+                if total_count > 0:
+                    self._mid = total_price / total_count
+            # else: keep previous mid
+
+        # Round mid to 3 decimals
+        self._mid = round(self._mid, 3)
+        self._mid_history.append(self._mid)
+
+        # Compute bid/ask from mid + action
+        half_spread, skew = scale_action(action, self._cfg)
+        self._current_half_spread = half_spread
+        self._current_skew = skew
+
+        # Base bid/ask (before subpenny adjustment)
+        bid_base = self._mid - half_spread + skew
+        ask_base = self._mid + half_spread + skew
+
+        # Apply subpenny adjustment for queue priority (task 4)
+        bid = self._apply_subpenny_adjustment(bid_base, "bid")
+        ask = self._apply_subpenny_adjustment(ask_base, "ask")
+
+        # Clamp to valid Kalshi range [0.01, 0.99]
+        bid = max(0.01, min(0.99, bid))
+        ask = max(0.01, min(0.99, ask))
+
+        # Ensure ask > bid (prevent crossing)
+        if ask <= bid:
+            # If adjustment caused crossing, revert to base prices
+            bid = max(0.01, min(0.99, bid_base))
+            ask = max(0.01, min(0.99, ask_base))
+
+        # Round to 3 decimals
+        bid = round(bid, 3)
+        ask = round(ask, 3)
+
+        self._current_bid = bid
+        self._current_ask = ask
+
+        # Simulate fills (simple model: probability based on proximity to market)
+        # For now, no fills to keep it simple - full implementation in later tasks
+        fills_buy_delta = 0
+        fills_sell_delta = 0
+        reward = 0.0
+
+        # Update fill counters
+        self._fills_buy += fills_buy_delta
+        self._fills_sell += fills_sell_delta
+
+        # Build next observation (task 5)
+        obs = self._build_obs()
+
+        # Build info dict
+        info = {
+            "ticker": self._current_ticker,
+            "timestamp": self._current_timestamp,
+            "bid": self._current_bid,
+            "ask": self._current_ask,
+            "inventory": self._inventory,
+            "fills_buy": self._fills_buy,
+            "fills_sell": self._fills_sell,
+            "pnl": self._realized_pnl + self._unrealized_pnl(),
+            "reward": reward,
+            "half_spread": self._current_half_spread,
+            "skew": self._current_skew,
+            "realized_pnl": self._realized_pnl,
+            "unrealized_pnl": self._unrealized_pnl(),
+            "mid_price": self._mid,
+        }
+
+        # Increment step for next iteration
+        self._step_idx += 1
+
+        return obs, reward, False, False, info
 
     def _apply_subpenny_adjustment(self, price: float, side: str) -> float:
         """Apply subpenny adjustment for queue priority if market supports it.
