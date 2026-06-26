@@ -426,6 +426,10 @@ class MMEnv(gymnasium.Env):
         Returns:
             Adjusted price (or original if subpenny not valid)
         """
+        # Check if subpenny feature is enabled
+        if not self._cfg.subpenny_enabled:
+            return price
+
         # Check if metadata loader available
         if self._metadata_loader is None:
             return price  # No validation possible, return original

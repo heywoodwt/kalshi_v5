@@ -99,3 +99,31 @@ def test_subpenny_price_clamping():
         bid_high = 0.989
         bid_adjusted = env._apply_subpenny_adjustment(bid_high, "bid")
         assert bid_adjusted <= 0.99  # Should clamp to maximum
+
+
+def test_subpenny_respects_config_flag():
+    """Test that subpenny adjustment is disabled when subpenny_enabled=False."""
+    test_data = pl.DataFrame({
+        "ticker": ["DECI"],
+        "price_level_structure": ["deci_cent"],
+    })
+
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        test_data.write_parquet(f.name)
+        loader = MarketMetadataLoader(mode="parquet", parquet_path=f.name)
+        loader.load_metadata(["DECI"])
+
+        # Create config with subpenny disabled
+        cfg = MMConfig(subpenny_enabled=False)
+        env = MMEnv(ticker_data={}, cfg=cfg, metadata_loader=loader)
+        env._current_ticker = "DECI"
+
+        # Test that bid returns unchanged when subpenny disabled
+        bid_base = 0.463
+        bid_adjusted = env._apply_subpenny_adjustment(bid_base, "bid")
+        assert bid_adjusted == pytest.approx(bid_base, abs=0.0001)
+
+        # Test that ask returns unchanged when subpenny disabled
+        ask_base = 0.537
+        ask_adjusted = env._apply_subpenny_adjustment(ask_base, "ask")
+        assert ask_adjusted == pytest.approx(ask_base, abs=0.0001)
