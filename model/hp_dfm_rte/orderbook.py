@@ -21,6 +21,17 @@ class OrderbookSnapshot:
     yes_size: int = 0
     no_price: float | None = None
     no_size: int = 0
+    # Level 1 (1 tick away)
+    yes_price_l1: float | None = None
+    yes_size_l1: int = 0
+    no_price_l1: float | None = None
+    no_size_l1: int = 0
+    # Level 2 (2 ticks away)
+    yes_price_l2: float | None = None
+    yes_size_l2: int = 0
+    no_price_l2: float | None = None
+    no_size_l2: int = 0
+    # Metadata
     updated_at: datetime | None = None
 
     def age_s(self, current_time: datetime | None = None) -> float | None:
@@ -30,6 +41,39 @@ class OrderbookSnapshot:
         if current_time is None:
             current_time = datetime.now(timezone.utc)
         return max(0.0, (current_time - self.updated_at).total_seconds())
+
+    def mid_price(self) -> float | None:
+        """Compute mid price from best bid/ask.
+
+        Returns:
+            Mid price or None if either side missing
+        """
+        if self.yes_price is None or self.no_price is None:
+            return None
+        yes_ask = 1.0 - self.no_price
+        return (self.yes_price + yes_ask) / 2.0
+
+    def spread(self) -> float | None:
+        """Compute bid-ask spread.
+
+        Returns:
+            Spread or None if either side missing
+        """
+        if self.yes_price is None or self.no_price is None:
+            return None
+        yes_ask = 1.0 - self.no_price
+        return yes_ask - self.yes_price
+
+    def imbalance(self) -> float:
+        """Book imbalance: (bid_size - ask_size) / total.
+
+        Returns:
+            Imbalance in [-1, 1] range
+        """
+        total = self.yes_size + self.no_size
+        if total == 0:
+            return 0.0
+        return (self.yes_size - self.no_size) / total
 
 
 def _coerce_float(value: Any) -> float | None:
