@@ -8,51 +8,104 @@ from datetime import datetime, timezone
 from rl_bot.mm_config import MMConfig
 from rl_bot.mm_metadata import MarketMetadataLoader
 from model.hp_dfm_rte.orderbook import OrderbookSnapshot
+from rl_bot.reward import compute_maker_fee
+
+
+def _ensure_datetime(trades_df: pl.DataFrame) -> pl.DataFrame:
+    """Cast created_time to datetime if it's still a string."""
+    if trades_df["created_time"].dtype == pl.Utf8:
+        trades_df = trades_df.with_columns(
+            pl.col("created_time")
+            .str.replace(r"\+00:00$", "Z")
+            .str.to_datetime("%Y-%m-%dT%H:%M:%S%.fZ", time_zone="UTC")
+        )
+    return trades_df
 
 
 def preprocess_mm_data(
     trades_df: pl.DataFrame,
     orderbooks_df: pl.DataFrame | None = None,
     window_size_s: int = 60,
+    split_date: str | None = None,
+    split_mode: str = "train",
 ) -> dict[str, list[dict]]:
     """Merge trades and orderbooks into time-aligned windows.
 
-    TODO: Full implementation in Task 6
+    Vectorized implementation: uses Polars group_by instead of row-by-row
+    Python iteration. Stores per-window trade data as numpy arrays for fast
+    fill simulation (no dict hashing per trade in step()).
+
+    Args:
+        split_date: ISO date string (e.g. "2026-04-23") for temporal split.
+                    None = no split, use all data.
+        split_mode: "train" = data before split_date, "test" = data on/after split_date.
     """
-    # Minimal implementation for now
+    trades_df = _ensure_datetime(trades_df)
     trades_df = trades_df.sort(["ticker", "created_time"])
 
-    if trades_df["created_time"].dtype == pl.Utf8:
-        trades_df = trades_df.with_columns(
-            pl.col("created_time").str.to_datetime("%Y-%m-%dT%H:%M:%S%.fZ")
-        )
+    # Apply temporal split filter
+    if split_date is not None:
+        if "T" in split_date:
+            cutoff = datetime.strptime(split_date, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        else:
+            cutoff = datetime.strptime(split_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if split_mode == "train":
+            trades_df = trades_df.filter(pl.col("created_time") < cutoff)
+        else:
+            trades_df = trades_df.filter(pl.col("created_time") >= cutoff)
 
+    # Truncate to window boundaries
     trades_df = trades_df.with_columns(
         pl.col("created_time").dt.truncate(f"{window_size_s}s").alias("window")
     )
 
+    # Encode taker_side as int for numpy: 0 = "no" (buy), 1 = "yes" (sell)
+    trades_df = trades_df.with_columns(
+        (pl.col("taker_side") == "yes").cast(pl.Int8).alias("side_int")
+    )
+
+    # Pre-compute per-window aggregates via Polars group_by (no Python loops)
+    agg_df = trades_df.group_by(["ticker", "window"]).agg([
+        # VWAP numerator/denominator for mid-price fallback
+        (pl.col("yes_price") * pl.col("count")).sum().alias("price_x_count"),
+        pl.col("count").sum().alias("total_count"),
+        # Trade count for volume observation
+        pl.col("count").len().alias("n_trades"),
+        # Raw arrays for fill simulation (stored as lists, converted to numpy per window)
+        pl.col("yes_price").alias("prices"),
+        pl.col("count").alias("counts"),
+        pl.col("side_int").alias("sides"),
+    ]).sort(["ticker", "window"])
+
+    # Build result dict with numpy arrays per window
     result: dict[str, list[dict]] = {}
+    # Partition by ticker — each partition is already sorted by window
+    for ticker_df in agg_df.partition_by("ticker", maintain_order=True):
+        ticker = ticker_df["ticker"][0]
+        n_windows = len(ticker_df)
+        windows: list[dict] = [None] * n_windows  # pre-allocate list
 
-    for ticker in trades_df["ticker"].unique().sort().to_list():
-        ticker_trades = trades_df.filter(pl.col("ticker") == ticker)
-        windows: list[dict] = []
+        # Extract columns as Python lists for fast iteration (no per-row Polars overhead)
+        timestamps = ticker_df["window"].to_list()
+        prices_col = ticker_df["prices"].to_list()
+        counts_col = ticker_df["counts"].to_list()
+        sides_col = ticker_df["sides"].to_list()
+        vwap_num = ticker_df["price_x_count"].to_list()
+        vwap_den = ticker_df["total_count"].to_list()
+        n_trades_col = ticker_df["n_trades"].to_list()
 
-        for window_time in ticker_trades["window"].unique().sort().to_list():
-            window_trades_df = ticker_trades.filter(pl.col("window") == window_time)
-            trades_list = []
-            for row in window_trades_df.iter_rows(named=True):
-                trades_list.append({
-                    "yes_price": float(row["yes_price"]),
-                    "count": int(row["count"]),
-                    "taker_side": row["taker_side"],
-                    "created_time": row["created_time"],
-                })
-
-            windows.append({
-                "trades": trades_list,
-                "orderbook": None,  # Will be added in Task 6
-                "timestamp": window_time,
-            })
+        for i in range(n_windows):
+            # Convert list columns to numpy arrays (contiguous, cache-friendly)
+            windows[i] = {
+                "prices": np.array(prices_col[i], dtype=np.float64),
+                "counts": np.array(counts_col[i], dtype=np.int32),
+                "sides": np.array(sides_col[i], dtype=np.int8),
+                "vwap": vwap_num[i] / vwap_den[i] if vwap_den[i] > 0 else 0.5,
+                "n_trades": n_trades_col[i],
+                "total_count": vwap_den[i],
+                "orderbook": None,
+                "timestamp": timestamps[i],
+            }
 
         result[ticker] = windows
 
@@ -160,7 +213,9 @@ class MMEnv(gymnasium.Env):
         self._fills_buy = 0
         self._fills_sell = 0
         self._realized_pnl = 0.0
-        self._tte_hours = 1.0
+        self._prev_value = 0.0  # previous step's total value for delta reward
+        self._avg_entry_price = 0.5  # weighted avg entry price for position
+        self._tte_hours = 24.0
         self._current_bid = 0.0
         self._current_ask = 0.0
         self._current_half_spread = 0.0
@@ -204,9 +259,9 @@ class MMEnv(gymnasium.Env):
             bid_l2 = ask_l2 = 0.02
             imbalance = 0.0
 
-        # Trade volume in current window
-        trades = window.get("trades", [])
-        volume_1m = min(len(trades) / 50.0, 1.0) if trades else 0.0
+        # Trade volume in current window (use pre-aggregated count)
+        n_trades = window.get("n_trades", 0)
+        volume_1m = min(n_trades / 50.0, 1.0) if n_trades else 0.0
 
         # Position features
         inv_norm = self._inventory / max(self._cfg.max_inventory, 1)
@@ -249,14 +304,17 @@ class MMEnv(gymnasium.Env):
 
     def _unrealized_pnl(self) -> float:
         """Calculate unrealized PnL based on current inventory and mid price."""
-        return self._inventory * (self._mid - 0.5)
+        if self._inventory == 0:
+            return 0.0
+        return self._inventory * (self._mid - self._avg_entry_price)
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         """Reset environment to initial state.
 
         Returns:
             observation, info
         """
+        super().reset(seed=seed, options=options)
         if not self._tickers:
             # No data to reset to
             obs = np.zeros(16, dtype=np.float32)
@@ -277,7 +335,9 @@ class MMEnv(gymnasium.Env):
         self._fills_buy = 0
         self._fills_sell = 0
         self._realized_pnl = 0.0
-        self._tte_hours = 1.0
+        self._prev_value = 0.0
+        self._avg_entry_price = 0.5
+        self._tte_hours = 24.0
         self._current_bid = 0.0
         self._current_ask = 0.0
         self._current_half_spread = 0.0
@@ -331,20 +391,15 @@ class MMEnv(gymnasium.Env):
         window = self._windows[self._step_idx]
         self._current_timestamp = window.get("timestamp")
 
-        # Update mid price from orderbook or VWAP
+        # Update mid price from orderbook or pre-computed VWAP
         orderbook = window.get("orderbook")
         if orderbook is not None and orderbook.mid_price() is not None:
-            # Use orderbook mid (task 3)
             self._mid = orderbook.mid_price()
         else:
-            # Fallback to VWAP from trades
-            trades = window.get("trades", [])
-            if trades:
-                total_price = sum(t["yes_price"] * t["count"] for t in trades)
-                total_count = sum(t["count"] for t in trades)
-                if total_count > 0:
-                    self._mid = total_price / total_count
-            # else: keep previous mid
+            # Use pre-aggregated VWAP (computed in preprocess_mm_data)
+            vwap = window.get("vwap")
+            if vwap is not None and vwap > 0:
+                self._mid = vwap
 
         # Round mid to 3 decimals
         self._mid = round(self._mid, 3)
@@ -380,17 +435,67 @@ class MMEnv(gymnasium.Env):
         self._current_bid = bid
         self._current_ask = ask
 
-        # Simulate fills (simple model: probability based on proximity to market)
-        # For now, no fills to keep it simple - full implementation in later tasks
-        fills_buy_delta = 0
-        fills_sell_delta = 0
-        reward = 0.0
+        # Simulate fills using numpy vectorized ops (no Python per-trade loop)
+        # Queue priority: subpenny orders jump ahead of makers at rounded cent
+        has_subpenny_bid = (bid != bid_base) and self._cfg.subpenny_enabled
+        has_subpenny_ask = (ask != ask_base) and self._cfg.subpenny_enabled
+        queue_competitors = 5  # assumed number of other makers at same cent level
 
-        # Update fill counters
-        self._fills_buy += fills_buy_delta
-        self._fills_sell += fills_sell_delta
+        prices = window.get("prices")
+        if prices is not None and len(prices) > 0:
+            counts = window["counts"]
+            sides = window["sides"]
 
-        # Build next observation (task 5)
+            # sides: 0 = "no" (taker bought NO -> we buy YES), 1 = "yes" (taker bought YES -> we sell YES)
+            # Vectorized mask for buy fills: taker_side=="no" AND price <= bid
+            buy_mask = (sides == 0) & (prices <= bid)
+            # Vectorized mask for sell fills: taker_side=="yes" AND price >= ask
+            sell_mask = (sides == 1) & (prices >= ask)
+
+            # Process buy fills
+            if buy_mask.any():
+                buy_prices = prices[buy_mask]
+                buy_counts = counts[buy_mask]
+                if not has_subpenny_bid:
+                    buy_counts = np.maximum(1, buy_counts // queue_competitors)
+                for j in range(len(buy_prices)):
+                    self._fill_buy(float(buy_prices[j]), int(buy_counts[j]))
+
+            # Process sell fills
+            if sell_mask.any():
+                sell_prices = prices[sell_mask]
+                sell_counts = counts[sell_mask]
+                if not has_subpenny_ask:
+                    sell_counts = np.maximum(1, sell_counts // queue_competitors)
+                for j in range(len(sell_prices)):
+                    self._fill_sell(float(sell_prices[j]), int(sell_counts[j]))
+
+        # Compute reward = delta(realized + unrealized PnL) - inventory penalty
+        new_value = self._realized_pnl + self._unrealized_pnl()
+        delta_pnl = new_value - self._prev_value
+        self._prev_value = new_value
+
+        # Inventory penalty (scaled by time-to-expiry if enabled)
+        inv_penalty = self._cfg.inventory_lambda * abs(self._inventory)
+        if self._cfg.inventory_tte_scale:
+            inv_penalty *= 1.0 / math.sqrt(self._tte_hours + 1.0)
+
+        reward = delta_pnl - inv_penalty
+
+        # Advance step and decrement time-to-expiry
+        self._step_idx += 1
+        self._tte_hours = max(0.0, self._tte_hours - (1.0 / 60.0))
+
+        # Check if episode is done
+        done = self._step_idx >= len(self._windows)
+
+        # Flatten inventory at episode end (realize at last mid, no exit fee)
+        if done and self._inventory != 0:
+            flatten_pnl = self._inventory * (self._mid - self._avg_entry_price)
+            self._realized_pnl += flatten_pnl
+            self._inventory = 0
+
+        # Build next observation
         obs = self._build_obs()
 
         # Build info dict
@@ -411,10 +516,52 @@ class MMEnv(gymnasium.Env):
             "mid_price": self._mid,
         }
 
-        # Increment step for next iteration
-        self._step_idx += 1
+        return obs, reward, done, False, info
 
-        return obs, reward, False, False, info
+    def _fill_buy(self, price: float, size: int) -> None:
+        """Execute a buy fill (agent buys YES contracts).
+        Respects inventory cap. Deducts maker fee from realized PnL.
+        """
+        # Cap size to stay within max_inventory
+        if self._inventory + size > self._cfg.max_inventory:
+            size = max(0, self._cfg.max_inventory - self._inventory)
+        if size <= 0:
+            return
+
+        # Deduct maker fee
+        fee = compute_maker_fee(size, price, self._cfg.maker_fee_rate)
+        self._realized_pnl -= fee
+
+        # Update weighted avg entry price
+        old_inv = self._inventory
+        self._inventory += size
+        if self._inventory > 0:
+            self._avg_entry_price = (old_inv * self._avg_entry_price + size * price) / self._inventory
+        self._fills_buy += size
+
+    def _fill_sell(self, price: float, size: int) -> None:
+        """Execute a sell fill (agent sells YES contracts).
+        Respects inventory cap (can't go more short than -max_inventory).
+        """
+        # Cap size to stay within -max_inventory
+        if self._inventory - size < -self._cfg.max_inventory:
+            size = max(0, self._inventory + self._cfg.max_inventory)
+        if size <= 0:
+            return
+
+        # Deduct maker fee
+        fee = compute_maker_fee(size, price, self._cfg.maker_fee_rate)
+        self._realized_pnl -= fee
+
+        # Update position
+        old_inv = self._inventory
+        self._inventory -= size
+        # Update avg entry price on direction flip
+        if self._inventory != 0 and ((old_inv > 0 and self._inventory < 0) or (old_inv < 0 and self._inventory > 0)):
+            self._avg_entry_price = price
+        elif self._inventory == 0:
+            self._avg_entry_price = self._mid
+        self._fills_sell += size
 
     def _apply_subpenny_adjustment(self, price: float, side: str) -> float:
         """Apply subpenny adjustment for queue priority if market supports it.

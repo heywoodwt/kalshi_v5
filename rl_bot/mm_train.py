@@ -85,20 +85,39 @@ def main():
         action="store_true",
         help="Disable subpenny pricing",
     )
+    parser.add_argument(
+        "--split-date",
+        type=str,
+        default=None,
+        help="Temporal split date (e.g. 2026-04-23). Train on data before, test on data after.",
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Which side of the split to use (default: train)",
+    )
     args = parser.parse_args()
 
-    # Load data
+    # Load data — use scan + filter + collect for predicate pushdown when
+    # a single category is requested. Avoids reading the full 24M-row parquet
+    # into memory for each per-category SLURM job.
     log.info(f"Loading trades from {args.data}")
-    trades = pl.read_parquet(args.data)
-    log.info(f"Loaded {len(trades):,} trades")
-
-    # Filter by category if specified
     if args.category != "all":
-        trades = trades.filter(pl.col("ticker").str.starts_with(args.category))
-        log.info(f"Filtered to {len(trades):,} trades for category {args.category}")
+        # Lazy scan with predicate pushdown — only reads matching row groups
+        trades = (
+            pl.scan_parquet(args.data)
+            .filter(pl.col("ticker").str.starts_with(args.category))
+            .collect()
+        )
+        log.info(f"Loaded {len(trades):,} trades for category {args.category}")
         if len(trades) == 0:
             log.error(f"No trades found for category {args.category}")
             sys.exit(1)
+    else:
+        trades = pl.read_parquet(args.data)
+        log.info(f"Loaded {len(trades):,} trades")
 
     # Discover unique tickers
     tickers = trades["ticker"].unique().sort().to_list()
@@ -112,7 +131,11 @@ def main():
 
     # Preprocess trades into windows
     log.info("Preprocessing trades into time windows")
-    windows = preprocess_mm_data(trades)
+    if args.split_date:
+        log.info(f"Temporal split: {args.split_mode} (cutoff={args.split_date})")
+    windows = preprocess_mm_data(
+        trades, split_date=args.split_date, split_mode=args.split_mode,
+    )
     log.info(f"Created {len(windows):,} time windows")
 
     # Create environment
@@ -124,7 +147,7 @@ def main():
     )
 
     def make_env():
-        return MMEnv(windows=windows, config=config, metadata_loader=metadata_loader)
+        return MMEnv(ticker_data=windows, cfg=config, metadata_loader=metadata_loader)
 
     env = DummyVecEnv([make_env])
     log.info("Created MM environment with 16-dim observation space")
@@ -144,7 +167,7 @@ def main():
         clip_range=0.2,
         ent_coef=0.01,
         verbose=1,
-        tensorboard_log=f"rl_bot/mm_logs/{args.run_name}",
+        tensorboard_log=None,  # disabled; install tensorboard to re-enable
     )
 
     # Setup checkpointing
