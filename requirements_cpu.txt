@@ -1,0 +1,15 @@
+# CPU-only dependencies for live trading (much smaller)
+python-dotenv==1.0.0
+websockets==16.0
+cryptography==49.0.0
+requests==2.31.0
+
+# CPU-only PyTorch (much smaller than CUDA version)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.1+cpu
+
+# RL and data
+stable-baselines3==2.2.1
+numpy==2.4.6
+gymnasium==0.29.1
+polars==1.42.0

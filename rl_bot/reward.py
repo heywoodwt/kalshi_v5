@@ -22,6 +22,43 @@ def compute_maker_fee(contracts: int, price: float, fee_rate: float) -> float:
     return math.ceil(raw * 100) / 100
 
 
+def compute_taker_fee(contracts: int, price: float, fee_rate: float) -> float:
+    """Calculate taker fee — same variance-based formula as the maker fee,
+    but at Kalshi's taker rate (0.07 vs 0.0175 maker). Live data shows 94.5%
+    of our fills end up taker (we cross the spread), so the simulator charges
+    this rate on most fills to keep sim fee drag honest.
+
+    Args:
+        contracts: number of contracts traded
+        price: YES-side market price (0.0 to 1.0)
+        fee_rate: base taker fee rate (e.g., 0.07 for 7%)
+
+    Returns:
+        Fee amount rounded up to nearest cent.
+    """
+    raw = fee_rate * contracts * price * (1.0 - price)
+    return math.ceil(raw * 100) / 100
+
+
+def fee_at_quote_size(contracts: int, price: float, fee_rate: float,
+                      quote_size: int) -> float:
+    """Fee for `contracts` executed as separate quote_size-lot orders.
+
+    Kalshi rounds each ORDER's fee up to the next cent. The live bot quotes
+    quote_size-lot orders, so a simulated fill of N contracts really executes
+    as ceil(N/quote_size) separate orders, each paying its own ceil'd fee.
+    At quote_size=1 and price 0.50 that's 1 cent per contract — 2.3x the
+    nominal rate — which the single-ceil sim fee badly understated.
+
+    A partial final lot is charged the full per-lot fee (pessimistic by at
+    most one sub-cent rounding; keeps the formula O(1) and branch-free).
+    """
+    quote_size = max(quote_size, 1)
+    n_lots = math.ceil(contracts / quote_size)
+    per_lot = math.ceil(fee_rate * quote_size * price * (1.0 - price) * 100) / 100
+    return per_lot * n_lots
+
+
 @dataclass
 class _Position:
     """Internal record of an open position.

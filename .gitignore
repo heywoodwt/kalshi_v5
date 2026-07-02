@@ -11,3 +11,23 @@ __pycache__/
 # Generated SLURM experiment scripts
 hpc/exp_*.slurm
 hpc/exploration_exps/
+
+# Secrets — never commit
+mm_ppo_bot.txt
+deploy/.env.live
+.env.live
+.claude/settings.local.json
+
+# Data, logs, and model artifacts (large / regenerable)
+output/
+*.log
+nohup.out
+rl_bot/mm_checkpoints/
+rl_bot/checkpoints/
+rl_bot/checkpoints_old_unrealistic/
+all_open_markets.json
+hpc/mm_results/
+hpc/mm_jobs/
+hpc/6_23/
+.pytest_cache/
+.DS_Store

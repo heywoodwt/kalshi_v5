@@ -38,7 +38,7 @@ def test_full_mm_pipeline_with_subpenny():
 
         # 4. Reset and check observation shape
         obs, info = env.reset()
-        assert obs.shape == (16,), f"Expected 16-dim obs, got {obs.shape}"
+        assert obs.shape == (20,), f"Expected 20-dim obs, got {obs.shape}"
 
         # 5. Take action and verify subpenny applied
         action = np.array([0.0, 0.0], dtype=np.float32)

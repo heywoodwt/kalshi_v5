@@ -56,8 +56,9 @@ class KalshiRESTClient:
 
     def _sign_request(self, timestamp: str, method: str, path: str, body: str = "") -> str:
         """Sign request with RSA-PSS and SHA256 per Kalshi API spec."""
-        # Message format: timestamp + method + path (no body for Kalshi)
-        message = f"{timestamp}{method}{path}"
+        # Strip query parameters from path before signing
+        path_without_query = path.split('?')[0]
+        message = f"{timestamp}{method}{path_without_query}"
 
         # Sign with RSA-PSS padding (DIGEST_LENGTH salt as per Kalshi docs)
         signature_bytes = self.private_key.sign(
@@ -356,7 +357,9 @@ class KalshiRESTClient:
             return 0
 
     def place_limit_order(self, ticker: str, side: Literal["buy", "sell"],
-                         price_cents: float, size: int = 1) -> Dict:
+                         price_cents: float, size: int = 1,
+                         post_only: bool = False,
+                         time_in_force: str = "good_till_canceled") -> Dict:
         """
         Place a limit order (simplified interface).
 
@@ -365,6 +368,10 @@ class KalshiRESTClient:
             side: "buy" or "sell"
             price_cents: Limit price in cents (1-99), supports subpenny (e.g. 50.1)
             size: Number of contracts
+            post_only: True = maker-only; the exchange rejects the order instead
+                       of letting it cross the spread and execute as taker
+            time_in_force: "good_till_canceled" for resting quotes,
+                           "immediate_or_cancel" for crossing risk exits
 
         Returns:
             Order response with order_id
@@ -378,6 +385,8 @@ class KalshiRESTClient:
             side=v2_side,
             price_dollars=price_dollars,
             count=float(size),
+            time_in_force=time_in_force,
+            post_only=post_only,
         )
 
     def get_recent_fills_for_ticker(self, ticker: str, since_minutes: int = 5) -> List[Dict]:

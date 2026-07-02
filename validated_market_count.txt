@@ -1,0 +1,67 @@
+Checking 98 validated categories for open markets...
+================================================================================
+  1. KXAAAGASD                        17 markets
+  2. KXAAAGASM                        33 markets
+  3. KXAAAGASW                        15 markets
+  4. KXAAPLCEOCHANGE                   2 markets
+  5. KXAAPLPRICEFOLD                   3 markets
+  7. KXABNB                           10 markets
+  8. KXABRAHAMSA                      13 markets
+ 10. KXACQANNOUNCESPACEX               1 markets
+ 11. KXADP                            42 markets
+ 13. KXAFLGAME                        18 markets
+ 18. KXAISPIKE                        16 markets
+ 19. KXAISTREAMSERIES                  8 markets
+ 20. KXALBUMDEBUT                      2 markets
+ 21. KXALBUMEQUIV                    200 markets
+ 22. KXALBUMLENGTH                    10 markets
+ 23. KXALBUMRELEASE                   90 markets
+ 28. KXALIENS                          9 markets
+ 29. KXALITOOUT                        3 markets
+ 31. KXALPRIMARY                       9 markets
+ 35. KXAPRPOTUS                        8 markets
+ 38. KXARODGRETIRE                     1 markets
+ 39. KXARREST                         24 markets
+ 41. KXARTISTSTREAMS                 200 markets
+ 42. KXARTISTSTREAMSU                 29 markets
+ 44. KXATPCHALLENGERMATCH             54 markets
+ 46. KXATPMATCH                       96 markets
+ 47. KXATPSETWINNER                  200 markets
+ 48. KXAVGMEASLESDJT                   7 markets
+ 49. KXBALANCEPOWERCOMBO               4 markets
+ 52. KXBALLONDOR                      31 markets
+ 53. KXBBCHARTPOSITIONALBUM          140 markets
+ 54. KXBBCHARTPOSITIONSONG           120 markets
+ 60. KXBESTLLMCHINA                    1 markets
+ 62. KXBILLS                          30 markets
+ 63. KXBILLSCOUNT                      4 markets
+ 64. KXBLUESPACEX                      1 markets
+ 65. KXBLUETSUNAMICOMBO                1 markets
+ 66. KXBLUEWAVECOMBO                   1 markets
+ 68. KXBOND                           24 markets
+ 70. KXBOXING                         28 markets
+ 75. KXBRENTD                         20 markets
+ 76. KXBRENTMON                       20 markets
+ 77. KXBRENTW                         20 markets
+ 78. KXBRPRES                         13 markets
+ 80. KXBTC                           200 markets
+ 81. KXBTCD                          200 markets
+ 82. KXBTCMAXMON                       8 markets
+ 83. KXBTCMAXY                         7 markets
+ 84. KXBTCMINMON                       3 markets
+ 85. KXBTCMINY                         4 markets
+ 86. KXBTCVSGOLD                       1 markets
+ 87. KXBTCY                           28 markets
+ 92. KXCABILLIONAIRETAX                1 markets
+ 93. KXCABLEAVE                        7 markets
+ 94. KXCABOUT                         21 markets
+ 95. KXLOLTOTALMAPS                    2 markets
+ 96. KXNBAMVP                         53 markets
+ 97. KXRAINLAXM                        7 markets
+ 98. KXSPOTIFYW                       15 markets
+================================================================================
+
+Categories with open markets: 59
+Total markets: 2135
+
+This is what we can deploy with the current trained models!

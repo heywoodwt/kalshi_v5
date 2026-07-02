@@ -3,7 +3,7 @@
 Uses the market-making environment (MMEnv) with:
 - Subpenny pricing for queue priority (+0.001 bid, -0.001 ask)
 - Market metadata loader for tick size validation
-- 16-dimensional observation space with orderbook features
+- 20-dimensional observation space with orderbook and realized-vol features
 - PPO algorithm from Stable Baselines3
 
 Usage:
@@ -129,12 +129,29 @@ def main():
     metadata = metadata_loader.load_metadata(tickers)
     log.info(f"Loaded metadata for {len(metadata):,} markets")
 
+    # Load orderbook data if provided
+    orderbooks_df = None
+    if args.orderbooks and Path(args.orderbooks).exists():
+        log.info(f"Loading orderbooks from {args.orderbooks}")
+        if args.category != "all":
+            orderbooks_df = (
+                pl.scan_parquet(args.orderbooks)
+                .filter(pl.col("ticker").str.starts_with(args.category))
+                .collect()
+            )
+        else:
+            orderbooks_df = pl.read_parquet(args.orderbooks)
+        log.info(f"Loaded {len(orderbooks_df):,} orderbook snapshots")
+    elif args.orderbooks:
+        log.warning(f"Orderbooks file not found: {args.orderbooks}")
+
     # Preprocess trades into windows
     log.info("Preprocessing trades into time windows")
     if args.split_date:
         log.info(f"Temporal split: {args.split_mode} (cutoff={args.split_date})")
     windows = preprocess_mm_data(
-        trades, split_date=args.split_date, split_mode=args.split_mode,
+        trades, orderbooks_df=orderbooks_df,
+        split_date=args.split_date, split_mode=args.split_mode,
     )
     log.info(f"Created {len(windows):,} time windows")
 
@@ -150,7 +167,7 @@ def main():
         return MMEnv(ticker_data=windows, cfg=config, metadata_loader=metadata_loader)
 
     env = DummyVecEnv([make_env])
-    log.info("Created MM environment with 16-dim observation space")
+    log.info("Created MM environment with 20-dim observation space")
     log.info(f"Subpenny pricing: {'enabled' if config.subpenny_enabled else 'disabled'}")
 
     # Create PPO agent
@@ -162,7 +179,7 @@ def main():
         n_steps=2048,
         batch_size=64,
         n_epochs=args.ppo_epochs,
-        gamma=0.99,
+        gamma=0.90,  # aggressive immediate-fill discount
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,

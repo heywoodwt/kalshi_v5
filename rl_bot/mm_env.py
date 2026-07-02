@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from rl_bot.mm_config import MMConfig
 from rl_bot.mm_metadata import MarketMetadataLoader
 from model.hp_dfm_rte.orderbook import OrderbookSnapshot
-from rl_bot.reward import compute_maker_fee
+from rl_bot.reward import compute_maker_fee, compute_taker_fee, fee_at_quote_size
 
 
 def _ensure_datetime(trades_df: pl.DataFrame) -> pl.DataFrame:
@@ -77,6 +77,41 @@ def preprocess_mm_data(
         pl.col("side_int").alias("sides"),
     ]).sort(["ticker", "window"])
 
+    # Parse orderbook data into per-(ticker, window) dict for obs features
+    ob_lookup: dict[tuple[str, any], dict] = {}
+    if orderbooks_df is not None and len(orderbooks_df) > 0:
+        # Ensure fetched_at is datetime
+        if "fetched_at" in orderbooks_df.columns:
+            ts_col = "fetched_at"
+        elif "timestamp" in orderbooks_df.columns:
+            ts_col = "timestamp"
+        else:
+            ts_col = None
+
+        if ts_col is not None:
+            if orderbooks_df[ts_col].dtype == pl.Utf8:
+                orderbooks_df = orderbooks_df.with_columns(
+                    pl.col(ts_col)
+                    .str.replace(r"\+00:00$", "Z")
+                    .str.to_datetime("%Y-%m-%dT%H:%M:%S%.fZ", time_zone="UTC")
+                )
+            # Truncate to same window boundaries as trades
+            orderbooks_df = orderbooks_df.with_columns(
+                pl.col(ts_col).dt.truncate(f"{window_size_s}s").alias("window")
+            )
+            # Take last snapshot per (ticker, window) and extract features
+            ob_agg = orderbooks_df.sort(ts_col).group_by(["ticker", "window"]).last()
+            for row in ob_agg.iter_rows(named=True):
+                key = (row["ticker"], row["window"])
+                ob_lookup[key] = {
+                    "spread": row.get("spread", 0.03) or 0.03,
+                    "bid_size": row.get("yes_size", 0) or 0,
+                    "ask_size": row.get("no_size", 0) or 0,
+                    "bid_depth": row.get("yes_depth", 0) or 0,
+                    "ask_depth": row.get("no_depth", 0) or 0,
+                    "imbalance": row.get("imbalance", 0.0) or 0.0,
+                }
+
     # Build result dict with numpy arrays per window
     result: dict[str, list[dict]] = {}
     # Partition by ticker — each partition is already sorted by window
@@ -96,6 +131,8 @@ def preprocess_mm_data(
 
         for i in range(n_windows):
             # Convert list columns to numpy arrays (contiguous, cache-friendly)
+            # Look up orderbook snapshot for this (ticker, window)
+            ob_snap = ob_lookup.get((ticker, timestamps[i]))
             windows[i] = {
                 "prices": np.array(prices_col[i], dtype=np.float64),
                 "counts": np.array(counts_col[i], dtype=np.int32),
@@ -103,7 +140,7 @@ def preprocess_mm_data(
                 "vwap": vwap_num[i] / vwap_den[i] if vwap_den[i] > 0 else 0.5,
                 "n_trades": n_trades_col[i],
                 "total_count": vwap_den[i],
-                "orderbook": None,
+                "orderbook": ob_snap,  # dict with spread/bid_size/ask_size or None
                 "timestamp": timestamps[i],
             }
 
@@ -121,12 +158,12 @@ def scale_action(action: np.ndarray, cfg: MMConfig) -> tuple[float, float]:
 
     Returns:
         (half_spread, skew) tuple
-        - half_spread: in range [0.01, 0.10] (minimum 1 cent, maximum 10 cents)
+        - half_spread: in range [0.01, 0.50] (minimum 1 cent, maximum 50 cents)
         - skew: in range [-0.05, 0.05] (skew prices by up to 5 cents)
     """
-    # Map half_spread_control from [-1, 1] to [0.01, 0.10]
+    # Map half_spread_control from [-1, 1] to [0.01, 0.50]
     half_spread_control = np.clip(action[0], -1.0, 1.0)
-    half_spread = 0.01 + (half_spread_control + 1.0) / 2.0 * 0.09  # [0.01, 0.10]
+    half_spread = 0.01 + (half_spread_control + 1.0) / 2.0 * 0.49  # [0.01, 0.50]
 
     # Map skew_control from [-1, 1] to [-0.05, 0.05]
     skew_control = np.clip(action[1], -1.0, 1.0)
@@ -162,7 +199,7 @@ class MMEnv(gymnasium.Env):
         self._metadata_loader = metadata_loader
         self._current_ticker = None
 
-        # Gymnasium spaces - 16 dimensions
+        # Gymnasium spaces - 20 dimensions
         self.observation_space = gymnasium.spaces.Box(
             low=np.array([
                 0.01,   # [0] mid_price
@@ -181,10 +218,14 @@ class MMEnv(gymnasium.Env):
                 -0.1,   # [13] momentum
                 -1.0,   # [14] realized_pnl_norm
                 0.0,    # [15] fills_ratio
+                -1.0,   # [16] trade_flow_imbalance
+                -0.1,   # [17] price_velocity
+                -1.0,   # [18] fill_toxicity
+                0.0,    # [19] realized_vol
             ], dtype=np.float32),
             high=np.array([
                 0.99,   # [0] mid_price
-                0.10,   # [1] spread
+                0.50,   # [1] spread (widened for illiquid markets)
                 1.0,    # [2] bid_depth_l0
                 1.0,    # [3] ask_depth_l0
                 1.0,    # [4] bid_depth_l1
@@ -199,8 +240,12 @@ class MMEnv(gymnasium.Env):
                 0.1,    # [13] momentum
                 1.0,    # [14] realized_pnl_norm
                 1.0,    # [15] fills_ratio
+                1.0,    # [16] trade_flow_imbalance
+                0.1,    # [17] price_velocity
+                1.0,    # [18] fill_toxicity
+                1.0,    # [19] realized_vol
             ], dtype=np.float32),
-            shape=(16,),
+            shape=(20,),
             dtype=np.float32,
         )
 
@@ -221,6 +266,7 @@ class MMEnv(gymnasium.Env):
         self._current_half_spread = 0.0
         self._current_skew = 0.0
         self._current_timestamp = None
+        self._domain_rand_spread_extra = 0.0
 
         # Action space: [half_spread_control, skew_control]
         # Both in range [-1, 1]
@@ -232,17 +278,30 @@ class MMEnv(gymnasium.Env):
         )
 
     def _build_obs(self) -> np.ndarray:
-        """Build 16-dimensional observation vector.
+        """Build 20-dimensional observation vector.
 
         Returns:
-            np.array with 16 elements representing market and position state
+            np.array with 20 elements representing market, position,
+            adverse-selection, and volatility state
         """
         # Get current window's orderbook (may be None)
         window = self._windows[self._step_idx] if self._step_idx < len(self._windows) else {}
         orderbook = window.get("orderbook")
 
         # Orderbook features (fallback to defaults if missing)
-        if orderbook is not None:
+        # orderbook can be an OrderbookSnapshot object (live) or a dict (training)
+        if orderbook is not None and isinstance(orderbook, dict):
+            # Dict from preprocess_mm_data orderbook integration
+            spread = orderbook.get("spread", 0.03) or 0.03
+            bid_l0 = min((orderbook.get("bid_size", 0) or 0) / 100.0, 1.0)
+            ask_l0 = min((orderbook.get("ask_size", 0) or 0) / 100.0, 1.0)
+            bid_l1 = min((orderbook.get("bid_depth", 0) or 0) / 200.0, 1.0)  # L1 approx
+            ask_l1 = min((orderbook.get("ask_depth", 0) or 0) / 200.0, 1.0)
+            bid_l2 = 0.02  # no L2 data in collected orderbooks
+            ask_l2 = 0.02
+            imbalance = orderbook.get("imbalance", 0.0) or 0.0
+        elif orderbook is not None:
+            # OrderbookSnapshot object (live trading)
             spread = orderbook.spread() or 0.03
             bid_l0 = min(orderbook.yes_size / 100.0, 1.0)
             ask_l0 = min(orderbook.no_size / 100.0, 1.0)
@@ -280,6 +339,56 @@ class MMEnv(gymnasium.Env):
         # Fill ratio (how often our quotes got hit)
         fills_ratio = (self._fills_buy + self._fills_sell) / max(self._cfg.quote_size, 1.0)
 
+        # Domain randomization: widen observed spread to simulate liquidity gaps
+        spread += getattr(self, "_domain_rand_spread_extra", 0.0)
+
+        # Domain randomization: randomly zero out top-of-book depth to simulate
+        # fleeting liquidity (the agent learns not to rely on displayed size)
+        if self.np_random.random() < self._cfg.domain_rand_volume_prob:
+            bid_l0 = 0.0
+            ask_l0 = 0.0
+
+        # Clip spread to observation space bound
+        spread = min(spread, 0.50)
+
+        # --- Anti-adverse-selection features ---
+
+        # [16] Trade flow imbalance: buy vs sell taker volume in current window
+        sides = window.get("sides")
+        counts = window.get("counts")
+        if sides is not None and counts is not None and len(sides) > 0:
+            buy_mask = (sides == 0)   # taker_side="no" = YES buyers
+            sell_mask = (sides == 1)
+            buy_vol = counts[buy_mask].sum()
+            sell_vol = counts[sell_mask].sum()
+            flow_imbalance = (buy_vol - sell_vol) / max(buy_vol + sell_vol, 1)
+        else:
+            flow_imbalance = 0.0
+
+        # [17] Price velocity: rate of mid change over last 3 steps (faster than momentum's 5)
+        if len(self._mid_history) >= 3:
+            velocity = (self._mid - self._mid_history[-3]) / 3.0
+        else:
+            velocity = 0.0
+
+        # [18] Fill toxicity: imbalance of our own fills this episode
+        # If we're only getting filled on one side, informed flow is hitting us
+        total_fills = self._fills_buy + self._fills_sell
+        if total_fills > 0:
+            fill_toxicity = (self._fills_buy - self._fills_sell) / total_fills
+        else:
+            fill_toxicity = 0.0
+
+        # [19] Realized volatility: rolling stddev of mid over last 20 windows,
+        # normalized by the 0.05 MM-friendly/hostile threshold. Lets the policy
+        # widen spreads (or sit out) in volatile regimes where adverse selection
+        # is largest, instead of needing separate per-regime models.
+        if len(self._mid_history) >= 3:
+            realized_vol = float(np.std(self._mid_history[-20:]))
+        else:
+            realized_vol = 0.0
+        vol_norm = float(np.clip(realized_vol / 0.05, 0.0, 1.0))
+
         obs = np.array([
             self._mid,          # [0] mid_price
             spread,             # [1] spread
@@ -297,6 +406,10 @@ class MMEnv(gymnasium.Env):
             momentum,           # [13] momentum
             realized_norm,      # [14] realized_pnl_norm
             fills_ratio,        # [15] fills_ratio
+            flow_imbalance,     # [16] trade_flow_imbalance
+            velocity,           # [17] price_velocity
+            fill_toxicity,      # [18] fill_toxicity
+            vol_norm,           # [19] realized_vol
         ], dtype=np.float32)
 
         # Clip to valid ranges (safety)
@@ -317,7 +430,7 @@ class MMEnv(gymnasium.Env):
         super().reset(seed=seed, options=options)
         if not self._tickers:
             # No data to reset to
-            obs = np.zeros(16, dtype=np.float32)
+            obs = np.zeros(20, dtype=np.float32)
             return obs, {}
 
         # Select next ticker (cycle through tickers)
@@ -343,6 +456,7 @@ class MMEnv(gymnasium.Env):
         self._current_half_spread = 0.0
         self._current_skew = 0.0
         self._current_timestamp = None
+        self._domain_rand_spread_extra = 0.0
 
         # Build initial observation
         obs = self._build_obs()
@@ -359,7 +473,7 @@ class MMEnv(gymnasium.Env):
             action: np.array([half_spread_control, skew_control]) in range [-1, 1]
 
         Returns:
-            observation: 16-dim state vector
+            observation: 20-dim state vector
             reward: realized PnL change from fills
             terminated: True if episode is done (ran out of data)
             truncated: False (not used for now)
@@ -393,13 +507,24 @@ class MMEnv(gymnasium.Env):
 
         # Update mid price from orderbook or pre-computed VWAP
         orderbook = window.get("orderbook")
-        if orderbook is not None and orderbook.mid_price() is not None:
-            self._mid = orderbook.mid_price()
-        else:
-            # Use pre-aggregated VWAP (computed in preprocess_mm_data)
+        if orderbook is not None and isinstance(orderbook, dict):
+            # Dict orderbook from training — use VWAP (dict has no mid_price method)
             vwap = window.get("vwap")
             if vwap is not None and vwap > 0:
                 self._mid = vwap
+        elif orderbook is not None and orderbook.mid_price() is not None:
+            self._mid = orderbook.mid_price()
+        else:
+            vwap = window.get("vwap")
+            if vwap is not None and vwap > 0:
+                self._mid = vwap
+
+        # Domain randomization: randomly widen spread by 1-4 cents to simulate
+        # liquidity gaps. Shifts mid slightly so agent sees a different spread
+        # in _build_obs() via the orderbook's spread field.
+        self._domain_rand_spread_extra = 0.0
+        if self.np_random.random() < self._cfg.domain_rand_spread_prob:
+            self._domain_rand_spread_extra = self.np_random.uniform(0.01, self._cfg.domain_rand_spread_max)
 
         # Round mid to 3 decimals
         self._mid = round(self._mid, 3)
@@ -439,44 +564,98 @@ class MMEnv(gymnasium.Env):
         # Queue priority: subpenny orders jump ahead of makers at rounded cent
         has_subpenny_bid = (bid != bid_base) and self._cfg.subpenny_enabled
         has_subpenny_ask = (ask != ask_base) and self._cfg.subpenny_enabled
-        queue_competitors = 5  # assumed number of other makers at same cent level
+        queue_competitors = 10  # realistic competitor count for liquid markets
 
         prices = window.get("prices")
         if prices is not None and len(prices) > 0:
             counts = window["counts"]
             sides = window["sides"]
 
-            # sides: 0 = "no" (taker bought NO -> we buy YES), 1 = "yes" (taker bought YES -> we sell YES)
-            # Vectorized mask for buy fills: taker_side=="no" AND price <= bid
-            buy_mask = (sides == 0) & (prices <= bid)
-            # Vectorized mask for sell fills: taker_side=="yes" AND price >= ask
-            sell_mask = (sides == 1) & (prices >= ask)
+            # --- Adverse-selection-aware fill simulation ---
+            # "Through" fills: price crosses our quote (100% fill — real execution)
+            # "At-touch" fills: price equals our quote (partial fill — queue position)
+            # This prevents the old behaviour where 100% of at-touch volume
+            # filled us, guaranteeing we always get picked off.
 
-            # Process buy fills
-            if buy_mask.any():
-                buy_prices = prices[buy_mask]
-                buy_counts = counts[buy_mask]
-                if not has_subpenny_bid:
-                    buy_counts = np.maximum(1, buy_counts // queue_competitors)
-                for j in range(len(buy_prices)):
-                    self._fill_buy(float(buy_prices[j]), int(buy_counts[j]))
+            # BUY fills: taker_side=="no" (taker bought NO -> we buy YES)
+            buy_through = (sides == 0) & (prices < bid)   # price strictly inside our bid
+            buy_touch   = (sides == 0) & (np.abs(prices - bid) < 1e-6)  # price equals our bid
 
-            # Process sell fills
-            if sell_mask.any():
-                sell_prices = prices[sell_mask]
-                sell_counts = counts[sell_mask]
-                if not has_subpenny_ask:
-                    sell_counts = np.maximum(1, sell_counts // queue_competitors)
-                for j in range(len(sell_prices)):
-                    self._fill_sell(float(sell_prices[j]), int(sell_counts[j]))
+            # SELL fills: taker_side=="yes" (taker bought YES -> we sell YES)
+            sell_through = (sides == 1) & (prices > ask)   # price strictly above our ask
+            sell_touch   = (sides == 1) & (np.abs(prices - ask) < 1e-6)  # price equals our ask
 
-        # Compute reward = delta(realized + unrealized PnL) - inventory penalty
-        new_value = self._realized_pnl + self._unrealized_pnl()
+            # Process buy through-fills (haircut — not all through volume fills us).
+            # Execute at OUR bid, not the print price: a resting order fills at
+            # its own limit price (price-time priority). Filling at the lower
+            # print price credited phantom edge on every through-fill.
+            if buy_through.any():
+                for j in np.where(buy_through)[0]:
+                    fill_count = int(counts[j] * self._cfg.through_fill_haircut)
+                    if fill_count > 0:
+                        self._fill_buy(bid, fill_count)
+
+            # Process buy at-touch fills (partial — queue position)
+            # No max(1,...) — if volume too thin, zero fills (realistic)
+            if buy_touch.any():
+                for j in np.where(buy_touch)[0]:
+                    if has_subpenny_bid:
+                        # Assume 1 other subpenny participant, split volume
+                        fill_count = int(counts[j]) // 2
+                    else:
+                        fill_count = int(counts[j]) // (queue_competitors + 1)
+                    if fill_count > 0:
+                        self._fill_buy(float(prices[j]), fill_count)
+
+            # Process sell through-fills — same as buys: execute at OUR ask,
+            # not the (higher) print price
+            if sell_through.any():
+                for j in np.where(sell_through)[0]:
+                    fill_count = int(counts[j] * self._cfg.through_fill_haircut)
+                    if fill_count > 0:
+                        self._fill_sell(ask, fill_count)
+
+            # Process sell at-touch fills (partial — queue position)
+            # No max(1,...) — if volume too thin, zero fills (realistic)
+            if sell_touch.any():
+                for j in np.where(sell_touch)[0]:
+                    if has_subpenny_ask:
+                        fill_count = int(counts[j]) // 2
+                    else:
+                        fill_count = int(counts[j]) // (queue_competitors + 1)
+                    if fill_count > 0:
+                        self._fill_sell(float(prices[j]), fill_count)
+
+        # Compute reward = delta(realized + unrealized PnL) - inventory penalty.
+        # Mark inventory at the NEXT window's VWAP (post-fill price), not this
+        # window's VWAP: the print that filled us is informed flow, and the mid
+        # drifts against the new position. Marking at the pre-fill/contemporaneous
+        # VWAP hides that cost (adverse selection) and upward-biases sim PnL vs
+        # live. The observation still uses the current mid — no look-ahead leaks
+        # into what the agent sees.
+        mark_mid = self._mid
+        if self._step_idx + 1 < len(self._windows):
+            next_vwap = self._windows[self._step_idx + 1].get("vwap")
+            if next_vwap is not None and next_vwap > 0:
+                mark_mid = next_vwap
+        unrealized_marked = self._inventory * (mark_mid - self._avg_entry_price) if self._inventory else 0.0
+        new_value = self._realized_pnl + unrealized_marked
         delta_pnl = new_value - self._prev_value
         self._prev_value = new_value
 
-        # Inventory penalty (scaled by time-to-expiry if enabled)
-        inv_penalty = self._cfg.inventory_lambda * abs(self._inventory)
+        # Inventory penalty — scaled by spread (wide spread = expensive to exit)
+        # and by time-to-expiry (less time = more urgency to flatten)
+        cur_spread = getattr(self, "_domain_rand_spread_extra", 0.0)
+        ob = window.get("orderbook")
+        if ob is not None and isinstance(ob, dict):
+            cur_spread += ob.get("spread", 0.03) or 0.03
+        elif ob is not None:
+            cur_spread += ob.spread() or 0.03
+        else:
+            cur_spread += 0.03
+        # Spread multiplier: 1.0 at 3¢ spread, scales linearly (wider = more penalty)
+        spread_mult = max(cur_spread / 0.03, 1.0)
+        inv_penalty = self._cfg.inventory_lambda * abs(self._inventory) * spread_mult
         if self._cfg.inventory_tte_scale:
             inv_penalty *= 1.0 / math.sqrt(self._tte_hours + 1.0)
 
@@ -489,10 +668,27 @@ class MMEnv(gymnasium.Env):
         # Check if episode is done
         done = self._step_idx >= len(self._windows)
 
-        # Flatten inventory at episode end (realize at last mid, no exit fee)
+        # Flatten inventory at episode end — cross the spread to exit (realistic)
         if done and self._inventory != 0:
-            flatten_pnl = self._inventory * (self._mid - self._avg_entry_price)
-            self._realized_pnl += flatten_pnl
+            # Estimate spread from last window's orderbook or fallback
+            ob = self._windows[self._step_idx - 1] if self._step_idx > 0 else {}
+            spread_est = 0.03  # fallback
+            orderbook = ob.get("orderbook")
+            if orderbook is not None:
+                s = orderbook.get("spread", 0.03) if isinstance(orderbook, dict) else (orderbook.spread() or 0.03)
+                if s and s > 0:
+                    spread_est = s
+            # Exit at bid (long) or ask (short), not mid
+            if self._inventory > 0:
+                exit_price = self._mid - spread_est / 2.0
+            else:
+                exit_price = self._mid + spread_est / 2.0
+            flatten_pnl = self._inventory * (exit_price - self._avg_entry_price)
+            # Crossing the spread to exit is a TAKER execution — charge the
+            # taker rate at live order granularity (was maker rate before)
+            exit_fee = fee_at_quote_size(abs(self._inventory), abs(exit_price),
+                                         self._cfg.taker_fee_rate, self._cfg.quote_size)
+            self._realized_pnl += flatten_pnl - exit_fee
             self._inventory = 0
 
         # Build next observation
@@ -528,8 +724,13 @@ class MMEnv(gymnasium.Env):
         if size <= 0:
             return
 
-        # Deduct maker fee
-        fee = compute_maker_fee(size, price, self._cfg.maker_fee_rate)
+        # Fee at live order granularity: quotes are quote_size-lot orders and
+        # Kalshi ceils each order's fee to the next cent. A fraction of fills
+        # pays the taker rate (stop-loss/expiry exits cross the spread; quotes
+        # themselves are post-only maker after the Phase 1 fixes).
+        rate_is_taker = self.np_random.random() < self._cfg.taker_fill_prob
+        rate = self._cfg.taker_fee_rate if rate_is_taker else self._cfg.maker_fee_rate
+        fee = fee_at_quote_size(size, price, rate, self._cfg.quote_size)
         self._realized_pnl -= fee
 
         # Update weighted avg entry price
@@ -549,8 +750,10 @@ class MMEnv(gymnasium.Env):
         if size <= 0:
             return
 
-        # Deduct maker fee
-        fee = compute_maker_fee(size, price, self._cfg.maker_fee_rate)
+        # Same fee model as _fill_buy: quote_size granularity + taker fraction
+        rate_is_taker = self.np_random.random() < self._cfg.taker_fill_prob
+        rate = self._cfg.taker_fee_rate if rate_is_taker else self._cfg.maker_fee_rate
+        fee = fee_at_quote_size(size, price, rate, self._cfg.quote_size)
         self._realized_pnl -= fee
 
         # Update position

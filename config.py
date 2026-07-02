@@ -14,11 +14,11 @@ load_dotenv()
 # AUTHENTICATION
 # ============================================================================
 
-# Kalshi API key (from .env: PROD_API_KEY)
-API_KEY = os.getenv("PROD_API_KEY")
+# Kalshi API key
+API_KEY = os.getenv("KALSHI_API_KEY") or os.getenv("PROD_API_KEY")
 
-# Path to RSA private key file (from .env: PROD_KEY_PATH)
-KEY_PATH = os.getenv("PROD_KEY_PATH", "rsa_keys/kalshi_bot_v3.txt")
+# Path to RSA private key file
+KEY_PATH = os.getenv("KALSHI_API_SECRET") or os.getenv("PROD_KEY_PATH", "mm_ppo_bot.txt")
 
 # ============================================================================
 # WEBSOCKET CONNECTION
@@ -27,7 +27,8 @@ KEY_PATH = os.getenv("PROD_KEY_PATH", "rsa_keys/kalshi_bot_v3.txt")
 # Kalshi WebSocket URL
 # Production: wss://trading-api.kalshi.com/trade-api/ws/v2
 # Elections API: wss://api.elections.kalshi.com/trade-api/ws/v2
-WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+# Recommended production WebSocket host (docs.kalshi.com/getting_started/api_environments)
+WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 
 # ============================================================================
 # TRADING MODE

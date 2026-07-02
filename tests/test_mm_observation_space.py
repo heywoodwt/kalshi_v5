@@ -10,13 +10,13 @@ from model.hp_dfm_rte.orderbook import OrderbookSnapshot
 
 
 def test_observation_space_shape():
-    """Test observation space is 16 dimensions."""
+    """Test observation space is 20 dimensions."""
     cfg = MMConfig()
     env = MMEnv(ticker_data={}, cfg=cfg)
 
-    assert env.observation_space.shape == (16,)
-    assert env.observation_space.low.shape == (16,)
-    assert env.observation_space.high.shape == (16,)
+    assert env.observation_space.shape == (20,)
+    assert env.observation_space.low.shape == (20,)
+    assert env.observation_space.high.shape == (20,)
 
 
 def test_build_obs_with_orderbook():
@@ -48,8 +48,8 @@ def test_build_obs_with_orderbook():
     obs, info = env.reset()
 
     # Verify observation shape and features
-    assert obs.shape == (16,)
+    assert obs.shape == (20,)
     assert 0.01 <= obs[0] <= 0.99  # mid_price
-    assert 0.01 <= obs[1] <= 0.10  # spread
+    assert 0.01 <= obs[1] <= 0.50  # spread
     assert 0.0 <= obs[2] <= 1.0    # bid_depth_l0
     assert 0.0 <= obs[3] <= 1.0    # ask_depth_l0

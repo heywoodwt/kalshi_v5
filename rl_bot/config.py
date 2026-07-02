@@ -14,7 +14,7 @@ class RLConfig:
     batch_size: int = 64
 
     # Training hyperparameters
-    gamma: float = 0.99
+    gamma: float = 0.90  # aggressive immediate-fill discount
     lr: float = 1e-4
     eps_start: float = 1.0
     eps_end: float = 0.05
