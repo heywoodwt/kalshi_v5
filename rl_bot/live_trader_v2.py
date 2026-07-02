@@ -207,12 +207,20 @@ class TradingState:
         total = self.wins + self.losses
         return self.wins / total if total > 0 else 0.0
 
-    @property
-    def total_position_value(self) -> float:
-        """Total capital locked in open positions (contracts * entry price)."""
+    def position_value(self, active_tickers: set | None = None) -> float:
+        """Capital locked in open positions (contracts * entry price).
+
+        With `active_tickers`, counts only markets this bot quotes. Legacy
+        positions from prior deployments (117 of them, unclosable or frozen
+        to settlement) otherwise blow through max_position_value at the 0.50
+        fallback entry and block ALL new quoting — the limit exists to cap
+        risk THIS bot adds, not inventory it can't do anything about.
+        """
         total = 0.0
         for ticker, inv in self.positions.items():
             if inv == 0:
+                continue
+            if active_tickers is not None and ticker not in active_tickers:
                 continue
             entry = self.entry_prices.get(ticker, 0.50)  # fallback to 0.50 if unknown
             total += abs(inv) * entry
@@ -1307,8 +1315,12 @@ class LiveTrader:
             return False
 
         # Check position value
-        if self.state.total_position_value >= TRADING_CONFIG["max_position_value"]:
-            logger.warning(f"Position value limit: ${self.state.total_position_value:.2f}")
+        # Scope the limit to markets this bot quotes — legacy inventory from
+        # prior deployments must not block new quoting (it did: $96.50 of old
+        # positions vs the $40 cap froze the bot entirely)
+        active_value = self.state.position_value(set(self.active_tickers))
+        if active_value >= TRADING_CONFIG["max_position_value"]:
+            logger.warning(f"Position value limit: ${active_value:.2f}")
             return False
 
         return True

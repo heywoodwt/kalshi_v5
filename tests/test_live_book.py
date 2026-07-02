@@ -369,3 +369,17 @@ def test_fractional_fill_below_one_contract_is_ignored():
     assert trader.state.positions["KXBTCD-26JUL02-T61099"] == 0
     assert trader.state.maker_fills == 0
     assert trader.state.fees_paid == 0.0
+
+
+def test_position_value_scoped_to_active_tickers():
+    # Legacy positions from prior deployments must not count against the
+    # bot's position-value risk cap (117 frozen legacy positions at the 0.50
+    # fallback blocked all quoting against a $40 limit)
+    trader = _make_trader()
+    trader.state.positions["LEGACY-27-JUNK"] = -2      # not quoted by this bot
+    trader.state.positions["KXBTCD-26JUL02-T60000"] = 1
+    trader.state.entry_prices["KXBTCD-26JUL02-T60000"] = 0.40
+    active = {"KXBTCD-26JUL02-T60000"}
+    assert trader.state.position_value(active) == pytest.approx(0.40)
+    # Unscoped still counts everything (legacy at the 0.50 fallback)
+    assert trader.state.position_value() == pytest.approx(0.40 + 2 * 0.50)
