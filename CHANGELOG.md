@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-07-07 (S3-refresh retrain results — SLURM 16816184)
+
+Retrained on the 8-day S3 window (6.6M trades, split 2026-07-06) with the
+Phase 3 sim. Out-of-sample (July 6-7 holdout), all checkpoints verified 20-dim
+and pulled local (July-1 finals kept as *.jul01.zip backups):
+
+- KXBTCD  +916.91 / 576 eps (398 traded, W/L 194/204). Caveat: 60 short
+  (1-2 step) episodes contribute +439.72 (~48%) — thin-strike flatten marks,
+  treat the ex-artifact ~+477 as the honest figure. Worst episode -11.06.
+- KXWCGAME +64.82 / 28 eps (18 traded, 11W/7L). Cleanest result: zero
+  artifact episodes, worst only -2.12.
+- KXAAAGASD +6.17 / 29 eps — POSITIVE now (July-1 model, trained on April
+  data, evaled -2.37). Artifacts NET -22.10 here, so genuine spread capture
+  ~+28. Candidate to re-add to the lowvol whitelist.
+- KXAAAGASM (421 trades in window) and KXADP (9) not retrained.
+
+Noted: the category prefix filter also matches KXWCGAMEGOALS tickers in
+KXWCGAME training/eval (4/28 eval episodes, $0 PnL impact — benign for now).
+
 ## 2026-07-07 (profile-guided speed pass)
 
 Profiled both hot paths before touching anything. Findings and fixes:
