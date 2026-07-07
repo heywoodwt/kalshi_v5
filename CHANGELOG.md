@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-07 (profile-guided speed pass)
+
+Profiled both hot paths before touching anything. Findings and fixes:
+
+- **Live WS callback (the win that matters)**: `model.predict` ran on EVERY
+  book tick even though `_execute_action`'s 1s throttle then discarded the
+  result — 72% of callback time wasted. The callback now folds the message
+  into the LiveBook (always — a stale book poisons later decisions), then
+  peeks the throttle BEFORE obs build + predict. Throttled ticks (the common
+  case): 89us -> 0.9us, ~99x. Full quote path: 89us -> 74us.
+- **Risk check off the per-tick path**: `_check_risk_limits` scanned all open
+  positions and rebuilt a 310-entry set per message; now runs only for
+  unthrottled ticks, with the active-ticker set cached.
+- **`scale_action` de-numpy'd**: np.clip on scalars costs ~40x a min/max
+  pair; runs per env step and per live quote. Pure Python now (also directly
+  Rust-translatable). Training env: 26.4k -> 40.2k steps/s (+52%).
+- **Obs builders**: scalar np.clip -> min/max; live obs clip bounds hoisted
+  to module constants (two array allocations per tick eliminated).
+
+Deliberately NOT optimized (measured, not worth it): preprocess_mm_data
+(0.07s / 140k trades, already vectorized), SB3 predict internals (0.061ms,
+model is tiny), REST startup loops (bound by Kalshi's ~10 req/s rate limit,
+not by code), PPO training throughput (GPU-bound; env is ~2.4% of budget).
+
 ## 2026-07-01 (validation-week launch: capital guards + positions parser fix)
 
 First live run with the Phase 1-3 fixes confirmed post-only works: 9/9 fills

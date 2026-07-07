@@ -134,6 +134,13 @@ def acquire_single_instance_lock() -> Optional[object]:
     return handle
 
 
+# Observation clip bounds — must match mm_env.py's observation_space exactly.
+# Module-level constants: allocating these two arrays per book tick showed up
+# in the callback profile.
+_OBS_LOW = np.array([0.01, 0.01, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, 0, -0.1, -1, 0, -1, -0.1, -1, 0], dtype=np.float32)
+_OBS_HIGH = np.array([0.99, 0.50, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 0.1, 1, 1, 1, 0.1, 1, 1], dtype=np.float32)
+
+
 def realized_vol(mid_history: list) -> float:
     """Rolling stddev of the last 20 mid prices — same formula as mm_env obs[19].
 
@@ -268,7 +275,8 @@ class LiveTrader:
         self.ws_client: Optional['KalshiWebSocketClient'] = None
         self.api_client: Optional[KalshiRESTClient] = None
         self.running = False
-        self.active_tickers: Dict[str, str] = {}  # category -> current ticker
+        self.active_tickers: Dict[str, str] = {}  # ticker -> category
+        self._active_ticker_set: Optional[set] = None  # cached set of active tickers (risk check hot path)
         # Metadata loader for subpenny tick size validation
         self.metadata_loader: Optional[MarketMetadataLoader] = None
         # Live tick sizes from Kalshi API (ticker -> min step size)
@@ -572,19 +580,9 @@ class LiveTrader:
         async def callback(ticker_msg: str, orderbook_data: dict):
             """Handle orderbook update (snapshot or delta)."""
             try:
-                # Check if category is halted
-                if category in self.state.halted_categories:
-                    logger.debug(f"Category {category} is halted")
-                    return
-
-                # Check risk limits
-                if not self._check_risk_limits():
-                    logger.debug(f"Risk limits prevent trading")
-                    return
-
-                # Route the message into the canonical LiveBook. Delta messages
-                # have price_dollars + delta_fp; snapshot messages carry yes/no
-                # level arrays (often one side per message — LiveBook merges).
+                # ALWAYS fold the message into the book first — even when the
+                # ticker is throttled or halted. Skipping updates leaves a
+                # stale book that poisons every later quote and stop-loss.
                 book = self.state.orderbooks.setdefault(ticker, LiveBook())
                 if "price_dollars" in orderbook_data and "delta_fp" in orderbook_data:
                     book.apply_delta(
@@ -597,6 +595,23 @@ class LiveTrader:
 
                 # One-sided, empty, or crossed book — nothing safe to do
                 if not book.is_valid():
+                    return
+
+                # Throttle peek BEFORE the expensive path: most book ticks
+                # arrive within 1s of the last quote for that ticker, and
+                # obs build + model.predict is ~90% of callback time — skip
+                # it for ticks the throttle would discard anyway.
+                # _execute_action still owns advancing the throttle clock.
+                if time.monotonic() - self.state.last_quote_time.get(ticker, 0.0) < 1.0:
+                    return
+
+                # Check if category is halted
+                if category in self.state.halted_categories:
+                    return
+
+                # Check risk limits (after the throttle peek — this scans all
+                # open positions, too expensive to run on every book tick)
+                if not self._check_risk_limits():
                     return
 
                 # Build observation from the canonical book
@@ -690,8 +705,8 @@ class LiveTrader:
                 logger.info(f"{ticker}: vol {vol:.4f} > {self.config.vol_filter_threshold} threshold — skipping quote")
                 return None
 
-            # [1] spread — clipped same as mm_env.py
-            spread = np.clip(best_ask - best_bid, 0.01, 0.50)
+            # [1] spread — clipped same as mm_env.py (scalar min/max, not np.clip)
+            spread = min(max(best_ask - best_bid, 0.01), 0.50)
 
             # [2-7] orderbook depths — mm_env.py normalizes by /100.0, NOT /1000.0
             # Levels come best-first from LiveBook (bids desc, asks asc in YES terms)
@@ -774,7 +789,7 @@ class LiveTrader:
                 fill_toxicity = 0.0
 
             # [19] Realized volatility — mm_env.py: std(mid_history[-20:]) / 0.05, clipped
-            vol_norm = float(np.clip(vol / 0.05, 0.0, 1.0))
+            vol_norm = min(max(vol / 0.05, 0.0), 1.0)
 
             # Build observation and clip to match mm_env.py observation_space bounds
             obs = np.array([
@@ -801,9 +816,7 @@ class LiveTrader:
             ], dtype=np.float32)
 
             # Clip to observation_space bounds (same as mm_env.py)
-            obs_low = np.array([0.01, 0.01, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, 0, -0.1, -1, 0, -1, -0.1, -1, 0], dtype=np.float32)
-            obs_high = np.array([0.99, 0.50, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 0.1, 1, 1, 1, 0.1, 1, 1], dtype=np.float32)
-            obs = np.clip(obs, obs_low, obs_high)
+            obs = np.clip(obs, _OBS_LOW, _OBS_HIGH)
 
             # Detailed observation breakdown — debug level to avoid log bloat
             logger.debug(
@@ -1317,8 +1330,11 @@ class LiveTrader:
         # Check position value
         # Scope the limit to markets this bot quotes — legacy inventory from
         # prior deployments must not block new quoting (it did: $96.50 of old
-        # positions vs the $40 cap froze the bot entirely)
-        active_value = self.state.position_value(set(self.active_tickers))
+        # positions vs the $40 cap froze the bot entirely). The set is cached:
+        # rebuilding 310 entries on every book tick showed up in profiling.
+        if self._active_ticker_set is None or len(self._active_ticker_set) != len(self.active_tickers):
+            self._active_ticker_set = set(self.active_tickers)
+        active_value = self.state.position_value(self._active_ticker_set)
         if active_value >= TRADING_CONFIG["max_position_value"]:
             logger.warning(f"Position value limit: ${active_value:.2f}")
             return False

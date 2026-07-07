@@ -161,13 +161,15 @@ def scale_action(action: np.ndarray, cfg: MMConfig) -> tuple[float, float]:
         - half_spread: in range [0.01, 0.50] (minimum 1 cent, maximum 50 cents)
         - skew: in range [-0.05, 0.05] (skew prices by up to 5 cents)
     """
-    # Map half_spread_control from [-1, 1] to [0.01, 0.50]
-    half_spread_control = np.clip(action[0], -1.0, 1.0)
-    half_spread = 0.01 + (half_spread_control + 1.0) / 2.0 * 0.49  # [0.01, 0.50]
+    # Pure-Python scalar math: np.clip on scalars costs ~40x a min/max pair,
+    # and this runs on every env step and every live quote decision
+    a0 = float(action[0])
+    a0 = -1.0 if a0 < -1.0 else (1.0 if a0 > 1.0 else a0)
+    half_spread = 0.01 + (a0 + 1.0) / 2.0 * 0.49  # [0.01, 0.50]
 
-    # Map skew_control from [-1, 1] to [-0.05, 0.05]
-    skew_control = np.clip(action[1], -1.0, 1.0)
-    skew = skew_control * 0.05  # [-0.05, 0.05]
+    a1 = float(action[1])
+    a1 = -1.0 if a1 < -1.0 else (1.0 if a1 > 1.0 else a1)
+    skew = a1 * 0.05  # [-0.05, 0.05]
 
     return round(half_spread, 3), round(skew, 3)
 
@@ -387,7 +389,7 @@ class MMEnv(gymnasium.Env):
             realized_vol = float(np.std(self._mid_history[-20:]))
         else:
             realized_vol = 0.0
-        vol_norm = float(np.clip(realized_vol / 0.05, 0.0, 1.0))
+        vol_norm = min(max(realized_vol / 0.05, 0.0), 1.0)  # scalar, avoid np.clip
 
         obs = np.array([
             self._mid,          # [0] mid_price
