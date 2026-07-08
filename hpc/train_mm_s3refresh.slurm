@@ -34,7 +34,7 @@ mkdir -p hpc/mm_results
 
 CATEGORIES=(KXBTCD KXWCGAME KXAAAGASD)
 CATEGORY="${CATEGORIES[$SLURM_ARRAY_TASK_ID]}"
-SPLIT="2026-07-06"
+SPLIT="2026-07-07"
 
 # Load modules and activate conda env
 module purge
