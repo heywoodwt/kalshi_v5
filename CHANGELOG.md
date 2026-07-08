@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-07-08 (S3-refresh retrain #2 — SLURM 16826081)
+
+Data refreshed to 2026-06-29..07-08 (6.9M trades, 1.1M book snapshots),
+split 2026-07-07 (~7d train / 1.5d holdout). All three checkpoints 20-dim,
+pulled local; July-7 finals kept as *.jul07.zip.
+
+Out-of-sample (July 7-8), ex-artifact = excluding 1-2 step flatten-mark eps:
+- KXBTCD   +603.88 / 408 eps (ex-artifact +338.75) — ~+226/day ex-artifact,
+  consistent with yesterday's ~+239/day on a different holdout
+- KXWCGAME  +66.08 / 22 eps, zero artifacts, 12W/5L, worst -2.42 — the
+  per-day edge IMPROVED (+44/day vs +32/day yesterday)
+- KXAAAGASD  +9.97 (ex-artifact +12.27), 9W/6L — second consecutive positive
+  holdout; whitelist re-add now supported by two independent test windows
+
 ## 2026-07-07 (S3-refresh retrain results — SLURM 16816184)
 
 Retrained on the 8-day S3 window (6.6M trades, split 2026-07-06) with the
