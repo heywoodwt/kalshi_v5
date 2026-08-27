@@ -11,3 +11,8 @@ polars
 pyarrow
 httpx
 numpy
+pandas
+statsmodels
+
+# Testing
+pytest

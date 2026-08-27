@@ -11,3 +11,7 @@ __pycache__/
 # Generated SLURM experiment scripts
 hpc/exp_*.slurm
 hpc/exploration_exps/
+
+# IDE
+.idea/
+.DS_Store
