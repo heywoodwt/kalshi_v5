@@ -38,6 +38,10 @@ class RLConfig:
     # Trading mode
     paper_trading: bool = True
 
+    # Reproducibility: seeds the agent's exploration RNG (see DQNAgent.__init__).
+    # None leaves the RNG unseeded.
+    seed: int | None = None
+
     # Fee schedule
     maker_fee_rate: float = 0.0175
 

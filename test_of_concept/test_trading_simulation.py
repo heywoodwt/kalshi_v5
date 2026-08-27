@@ -75,7 +75,7 @@ def simulate_market_activity(ticker, num_updates=50):
     return tracker, trade_count, prices
 
 
-def test_trade_pipeline(ticker, model, tracker, trade_count, prices):
+def run_trade_pipeline(ticker, model, tracker, trade_count, prices):
     """Test the complete trade filter and quoting pipeline."""
 
     metrics = tracker.get_metrics()
@@ -174,7 +174,7 @@ def main():
         model = MockModel(prediction_type=prediction_type)
 
         # Run pipeline
-        quotes = test_trade_pipeline(ticker, model, tracker, trade_count, prices)
+        quotes = run_trade_pipeline(ticker, model, tracker, trade_count, prices)
 
         # Show results
         if quotes and (quotes["buy"] or quotes["sell"]):
